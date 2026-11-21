@@ -1,12 +1,15 @@
 [Unit]
 Description=Spark Grid public TLS gateway
-After=network-online.target spark-grid-tunnel.service
+After=network-online.target
 Wants=network-online.target
-Requires=spark-grid-tunnel.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/spark-grid/tls_proxy.py --listen 0.0.0.0 --port 30001 --target 127.0.0.1:16301 --cert /etc/spark-grid/tls.crt --key /etc/spark-grid/tls.key
+User=@SPARK_SERVICE_USER@
+Group=@SPARK_SERVICE_GROUP@
+Environment=HOME="@SPARK_SERVICE_HOME@"
+EnvironmentFile=-"@SPARK_TLS_ENV_FILE@"
+ExecStart="@SPARK_PYTHON@" "@SPARK_TLS_PROXY@"
 Restart=always
 RestartSec=3
 NoNewPrivileges=yes

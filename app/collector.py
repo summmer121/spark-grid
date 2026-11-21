@@ -1,24 +1,32 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from .config import Settings
 from .db import Database
-from .ssh_runner import SSHError, collect_via_ssh
+from .ssh_runner import collect_via_ssh
+
+
+LOGGER = logging.getLogger("spark-grid.collector")
 
 
 class MetricsCollector:
-    def __init__(self, db: Database, settings: Settings):
+    def __init__(self, db: Database, config: Any):
         self.db = db
-        self.settings = settings
+        self.config = config
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._failures: dict[int, int] = {}
         self._net_samples: dict[int, tuple[float, dict[str, tuple[int, int]]]] = {}
         self._last_prune = 0.0
+
+    def _current(self) -> Any:
+        current = getattr(self.config, "current", None)
+        return current() if callable(current) else self.config
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -28,16 +36,27 @@ class MetricsCollector:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
 
-    def refresh_node(self, node: dict[str, Any]) -> dict[str, Any] | None:
+    def notify_config_changed(self) -> None:
+        self._wake.set()
+
+    def refresh_node(self, node: dict[str, Any]) -> dict[str, Any]:
         if not node.get("enabled"):
-            return None
+            return {"ok": False, "error": "节点已暂停监控"}
         return self._collect_one(node)
 
-    def _collect_one(self, node: dict[str, Any]) -> dict[str, Any] | None:
+    def _collect_one(self, node: dict[str, Any]) -> dict[str, Any]:
         node_id = int(node["id"])
         try:
-            metrics, latency_ms = collect_via_ssh(node, self.settings)
+            credentials = self.db.get_node_credentials(node_id)
+            if not credentials:
+                raise ValueError("节点不存在或凭据已被移除")
+            metrics, latency_ms = collect_via_ssh(
+                credentials,
+                self._current(),
+                password=credentials.get("ssh_password") or None,
+            )
             if int(metrics.get("metrics_schema") or 0) < 5:
                 raise ValueError("unsupported metrics schema")
             resources = metrics.setdefault("resources", {})
@@ -80,33 +99,57 @@ class MetricsCollector:
             compact["tx_rate"] = resources["tx_rate"]
             self.db.save_metrics(node_id, metrics, latency_ms)
             self._failures[node_id] = 0
-            return metrics
-        except (SSHError, OSError, ValueError, KeyError):
+            return {"ok": True, "metrics": metrics, "latency_ms": latency_ms}
+        except Exception as exc:
             failure_count = self._failures.get(node_id, 0) + 1
             self._failures[node_id] = failure_count
-            if failure_count >= 2:
+            message = self.db.record_node_error(node_id, exc)
+            if failure_count >= max(1, int(self._current().offline_failures)):
                 self.db.mark_node_offline(node_id)
-            return None
+            return {
+                "ok": False,
+                "error": message or "SSH 采集失败",
+                "failure_count": failure_count,
+            }
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            config = self._current()
             started = time.monotonic()
             nodes = [
                 node for node in self.db.list_nodes() if node.get("enabled", False)
             ]
             if nodes:
-                with ThreadPoolExecutor(max_workers=min(8, len(nodes))) as executor:
+                workers = min(max(1, int(config.collector_concurrency)), len(nodes))
+                with ThreadPoolExecutor(max_workers=workers) as executor:
                     futures = {
                         executor.submit(self._collect_one, node): node for node in nodes
                     }
                     for future in as_completed(futures):
+                        node = futures[future]
                         try:
-                            future.result()
-                        except Exception:
-                            pass
-            if time.monotonic() - self._last_prune > 600:
-                self.db.prune_history(self.settings.history_retention_hours)
+                            result = future.result()
+                            if not result.get("ok"):
+                                LOGGER.warning(
+                                    "collector failed for %s: %s",
+                                    node.get("host"),
+                                    result.get("error"),
+                                )
+                        except Exception as exc:
+                            message = self.db.record_node_error(int(node["id"]), exc)
+                            LOGGER.exception(
+                                "unexpected collector failure for %s: %s",
+                                node.get("host"),
+                                message,
+                            )
+            if (
+                time.monotonic() - self._last_prune
+                > max(30.0, float(config.prune_interval_seconds))
+            ):
+                self.db.prune_history(int(config.history_retention_hours))
                 self.db.purge_expired_sessions()
                 self._last_prune = time.monotonic()
             elapsed = time.monotonic() - started
-            self._stop.wait(max(0.5, self.settings.poll_interval - elapsed))
+            wait_for = max(0.5, float(config.poll_interval) - elapsed)
+            self._wake.wait(wait_for)
+            self._wake.clear()

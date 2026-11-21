@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+from .credential_store import CredentialCipher
 
 
 SCHEMA = """
@@ -36,14 +39,17 @@ CREATE TABLE IF NOT EXISTS nodes (
     host TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     ssh_port INTEGER NOT NULL DEFAULT 22,
-    ssh_user TEXT NOT NULL DEFAULT 'spark',
+    ssh_user TEXT NOT NULL DEFAULT '',
     ssh_key_path TEXT NOT NULL DEFAULT '',
+    ssh_password_ciphertext TEXT NOT NULL DEFAULT '',
     group_name TEXT NOT NULL DEFAULT '未分组',
     tags TEXT NOT NULL DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1,
     last_status TEXT NOT NULL DEFAULT 'unknown',
     last_seen INTEGER,
     last_latency_ms REAL,
+    last_error TEXT NOT NULL DEFAULT '',
+    last_error_at INTEGER,
     latest_metrics TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -80,8 +86,9 @@ CREATE TABLE IF NOT EXISTS discovered_nodes (
     machine_id TEXT,
     name TEXT,
     ssh_port INTEGER NOT NULL DEFAULT 22,
-    ssh_user TEXT NOT NULL DEFAULT 'spark',
+    ssh_user TEXT NOT NULL DEFAULT '',
     ssh_key_path TEXT NOT NULL DEFAULT '',
+    ssh_password_ciphertext TEXT NOT NULL DEFAULT '',
     info TEXT NOT NULL,
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL
@@ -119,15 +126,44 @@ def _json_load(value: str | None, default: Any) -> Any:
         return default
 
 
+def sanitize_error_message(value: Any, limit: int = 500) -> str:
+    text = str(value or "").strip()
+    text = re.sub(
+        r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
+        "[private key redacted]",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"(?i)\b(password|passwd|passphrase|token|authorization)\b"
+        r"(\s*[:=]\s*)([^\s,;]+)",
+        r"\1\2[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[redacted]", text)
+    if len(text) > limit:
+        text = text[-limit:]
+    return text
+
+
 class Database:
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        credential_key_path: Path | None = None,
+        timeout_seconds: float = 15,
+    ):
         self.path = path
+        self.timeout_seconds = max(0.1, float(timeout_seconds))
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.credential_cipher = CredentialCipher(
+            credential_key_path or self.path.parent / "ssh-secret.key"
+        )
         self.initialize()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=15)
+        connection = sqlite3.connect(self.path, timeout=self.timeout_seconds)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         try:
@@ -139,13 +175,29 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
-            self._ensure_column(connection, "nodes", "ssh_user", "TEXT NOT NULL DEFAULT 'spark'")
+            self._ensure_column(connection, "nodes", "ssh_user", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(connection, "nodes", "ssh_key_path", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(
-                connection, "discovered_nodes", "ssh_user", "TEXT NOT NULL DEFAULT 'spark'"
+                connection,
+                "nodes",
+                "ssh_password_ciphertext",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection, "nodes", "last_error", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(connection, "nodes", "last_error_at", "INTEGER")
+            self._ensure_column(
+                connection, "discovered_nodes", "ssh_user", "TEXT NOT NULL DEFAULT ''"
             )
             self._ensure_column(
                 connection, "discovered_nodes", "ssh_key_path", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(
+                connection,
+                "discovered_nodes",
+                "ssh_password_ciphertext",
+                "TEXT NOT NULL DEFAULT ''",
             )
 
     @staticmethod
@@ -264,25 +316,40 @@ class Database:
             ).fetchone()
         return self._node_row(row) if row else None
 
+    def get_node_credentials(self, node_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["ssh_password"] = self.credential_cipher.decrypt(
+            item.pop("ssh_password_ciphertext", "")
+        )
+        return item
+
     def add_node(
         self,
         host: str,
         name: str,
         ssh_port: int = 22,
-        ssh_user: str = "spark",
+        ssh_user: str = "",
         ssh_key_path: str = "",
+        ssh_password: str | None = None,
         group_name: str = "未分组",
         tags: Iterable[str] = (),
     ) -> dict[str, Any]:
         timestamp = _now()
         tag_json = json.dumps(list(dict.fromkeys(tags)), ensure_ascii=False)
+        password_ciphertext = self.credential_cipher.encrypt(ssh_password)
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO nodes(
-                    host, name, ssh_port, ssh_user, ssh_key_path, group_name, tags,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    host, name, ssh_port, ssh_user, ssh_key_path,
+                    ssh_password_ciphertext, group_name, tags, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     host,
@@ -290,6 +357,7 @@ class Database:
                     ssh_port,
                     ssh_user,
                     ssh_key_path,
+                    password_ciphertext,
                     group_name,
                     tag_json,
                     timestamp,
@@ -306,6 +374,8 @@ class Database:
             "ssh_port",
             "ssh_user",
             "ssh_key_path",
+            "ssh_password",
+            "clear_ssh_password",
             "group_name",
             "tags",
             "enabled",
@@ -314,6 +384,17 @@ class Database:
         values: list[Any] = []
         for key, value in fields.items():
             if key not in allowed:
+                continue
+            if key == "ssh_password":
+                if not value:
+                    continue
+                updates.append("ssh_password_ciphertext = ?")
+                values.append(self.credential_cipher.encrypt(str(value)))
+                continue
+            if key == "clear_ssh_password":
+                if value:
+                    updates.append("ssh_password_ciphertext = ?")
+                    values.append("")
                 continue
             if key == "tags":
                 value = json.dumps(value if isinstance(value, list) else [], ensure_ascii=False)
@@ -373,7 +454,8 @@ class Database:
                 """
                 UPDATE nodes
                 SET last_status = 'online', last_seen = ?, last_latency_ms = ?,
-                    latest_metrics = ?, updated_at = ?
+                    latest_metrics = ?, last_error = '', last_error_at = NULL,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -401,6 +483,20 @@ class Database:
                     compact.get("tx_rate", resources.get("tx_rate")),
                 ),
             )
+
+    def record_node_error(self, node_id: int, error: Any) -> str:
+        message = sanitize_error_message(error)
+        timestamp = _now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE nodes
+                SET last_error = ?, last_error_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (message, timestamp, timestamp, node_id),
+            )
+        return message
 
     def record_model_throughput(
         self,
@@ -575,36 +671,82 @@ class Database:
         self,
         info: dict[str, Any],
         remote_addr: str,
-        ssh_user: str = "spark",
+        ssh_user: str = "",
         ssh_port: int = 22,
         ssh_key_path: str = "",
+        ssh_password: str | None = None,
+        authenticated: bool = False,
+        preserve_password: bool = False,
     ) -> None:
-        host = str(info.get("host") or remote_addr)
+        host = str(remote_addr)
+        reported_host = str(info.get("host") or "").strip()
+        new_info = dict(info)
+        new_info.pop("ssh_password", None)
+        new_info["authenticated"] = bool(authenticated)
+        if reported_host:
+            new_info["reported_host"] = reported_host
         timestamp = _now()
-        payload = json.dumps(info, ensure_ascii=False, separators=(",", ":"))
         with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM discovered_nodes WHERE host = ?", (host,)
+            ).fetchone()
+            existing_info = _json_load(existing["info"], {}) if existing else {}
+            if authenticated:
+                merged_info = {**existing_info, **new_info}
+            else:
+                merged_info = dict(existing_info)
+                merged_info.update(
+                    {
+                        key: value
+                        for key, value in new_info.items()
+                        if key in {"authenticated", "ssh_error"}
+                    }
+                )
+                if reported_host:
+                    merged_info["reported_host"] = reported_host
+            payload = json.dumps(
+                merged_info,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            if preserve_password and existing:
+                password_ciphertext = existing["ssh_password_ciphertext"] or ""
+            else:
+                password_ciphertext = self.credential_cipher.encrypt(ssh_password)
+            machine_id = (
+                merged_info.get("machine_id")
+                if authenticated
+                else (existing["machine_id"] if existing else None)
+            )
+            name = (
+                merged_info.get("hostname") or host
+                if authenticated
+                else (existing["name"] if existing and existing["name"] else host)
+            )
             connection.execute(
                 """
                 INSERT INTO discovered_nodes(
                     host, machine_id, name, ssh_port, ssh_user, ssh_key_path,
-                    info, first_seen, last_seen
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ssh_password_ciphertext, info, first_seen, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(host) DO UPDATE SET
                     machine_id = excluded.machine_id,
                     name = excluded.name,
                     ssh_port = excluded.ssh_port,
                     ssh_user = excluded.ssh_user,
                     ssh_key_path = excluded.ssh_key_path,
+                    ssh_password_ciphertext = excluded.ssh_password_ciphertext,
                     info = excluded.info,
                     last_seen = excluded.last_seen
                 """,
                 (
                     host,
-                    info.get("machine_id"),
-                    info.get("hostname") or host,
+                    machine_id,
+                    name,
                     ssh_port,
                     ssh_user,
                     ssh_key_path,
+                    password_ciphertext,
                     payload,
                     timestamp,
                     timestamp,
@@ -626,11 +768,25 @@ class Database:
             ).fetchall()
         result = []
         for row in rows:
-            item = dict(row)
+            item = self._discovered_row(row)
             item["info"] = _json_load(item.get("info"), {})
             item["managed"] = item.pop("managed_node_id") is not None
             result.append(item)
         return result
+
+    def get_discovered_credentials(self, host: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM discovered_nodes WHERE host = ?", (host,)
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["ssh_password"] = self.credential_cipher.decrypt(
+            item.pop("ssh_password_ciphertext", "")
+        )
+        item["info"] = _json_load(item.get("info"), {})
+        return item
 
     def add_audit(
         self,
@@ -685,7 +841,16 @@ class Database:
     @staticmethod
     def _node_row(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
+        password_ciphertext = item.pop("ssh_password_ciphertext", "")
+        item["ssh_password_configured"] = bool(password_ciphertext)
         item["tags"] = _json_load(item.get("tags"), [])
         item["latest_metrics"] = _json_load(item.get("latest_metrics"), None)
         item["enabled"] = bool(item.get("enabled"))
+        return item
+
+    @staticmethod
+    def _discovered_row(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        password_ciphertext = item.pop("ssh_password_ciphertext", "")
+        item["ssh_password_configured"] = bool(password_ciphertext)
         return item

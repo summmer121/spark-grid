@@ -1,3 +1,5 @@
-# The center service uses only the Python standard library.
-# psutil on the center host improves local interface discovery but is optional.
+# psutil improves local interface discovery on the center host.
+# Paramiko is used only when SSH password authentication is selected.
 psutil>=5.9
+paramiko>=3.4
+cryptography>=41

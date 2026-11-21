@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 import threading
@@ -13,24 +12,11 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .config import Settings
+from .command_line import parse_command
+from .config import system_timezone_name
 from .db import Database
 from .ssh_runner import SSHError, run_remote_command
 
-
-MODEL_PORTS = [
-    int(value)
-    for value in os.getenv("SPARK_MODEL_PORTS", "8888,8000,8001,30000").split(",")
-    if value.strip().isdigit()
-]
-CONTAINER_HINTS = [
-    value.strip()
-    for value in os.getenv(
-        "SPARK_MODEL_CONTAINERS", "dsv41-head,dsv41-worker,spark-ds41f"
-    ).split(",")
-    if value.strip()
-]
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 SGLANG_PREFILL_RE = re.compile(
     r"\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) TP\d+ EP\d+\] "
@@ -115,26 +101,38 @@ def _sum_metric(
     return sum(values) if values else None
 
 
-def _display_sglang_time(value: str | None) -> str | None:
+def _display_sglang_time(
+    value: str | None, timezone_name: str | None = None
+) -> str | None:
     if not value:
         return None
     try:
         parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
             tzinfo=timezone.utc
         )
-        return parsed.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        return parsed.astimezone(
+            ZoneInfo(timezone_name or system_timezone_name())
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     except ValueError:
         return value
 
 
-def _display_vllm_time(value: str | None) -> str | None:
+def _display_vllm_time(
+    value: str | None, timezone_name: str | None = None
+) -> str | None:
     if not value:
         return None
     try:
         parsed = datetime.strptime(
             f"{datetime.now().year}-{value}", "%Y-%m-%d %H:%M:%S"
         ).replace(tzinfo=timezone.utc)
-        return parsed.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        return parsed.astimezone(
+            ZoneInfo(timezone_name or system_timezone_name())
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     except ValueError:
         return value
 
@@ -155,7 +153,29 @@ def _docker_since(value: str | None) -> str | None:
     return value
 
 
-def _parse_sglang_runtime(lines: list[str]) -> dict[str, Any]:
+def _container_command(config: Any, *args: str) -> list[str]:
+    runtime = parse_command(
+        config.model_container_runtime,
+        label="容器运行时命令",
+        max_length=500,
+    )
+    return [*runtime, *args]
+
+
+def _http_endpoint(base: str, path: str) -> str:
+    return f"{base.rstrip('/')}/{str(path).lstrip('/')}"
+
+
+def _model_base_url(config: Any, host: Any, port: Any) -> str:
+    scheme = str(getattr(config, "model_scheme", "http") or "http").strip().lower()
+    if scheme not in {"http", "https"}:
+        scheme = "http"
+    return f"{scheme}://{host}:{int(port)}"
+
+
+def _parse_sglang_runtime(
+    lines: list[str], timezone_name: str | None = None
+) -> dict[str, Any]:
     prefill_events: list[dict[str, Any]] = []
     decode_events: list[dict[str, Any]] = []
     errors = 0
@@ -167,7 +187,9 @@ def _parse_sglang_runtime(lines: list[str]) -> dict[str, Any]:
             item = match.groupdict()
             item["kind"] = "prefill"
             item["ts_epoch"] = _parse_naive_time(item["ts"])
-            item["display_ts"] = _display_sglang_time(item["ts"])
+            item["display_ts"] = _display_sglang_time(
+                item["ts"], timezone_name
+            )
             prefill_events.append(item)
             continue
         match = SGLANG_DECODE_RE.search(line)
@@ -175,7 +197,9 @@ def _parse_sglang_runtime(lines: list[str]) -> dict[str, Any]:
             item = match.groupdict()
             item["kind"] = "decode"
             item["ts_epoch"] = _parse_naive_time(item["ts"])
-            item["display_ts"] = _display_sglang_time(item["ts"])
+            item["display_ts"] = _display_sglang_time(
+                item["ts"], timezone_name
+            )
             decode_events.append(item)
     latest_prefill = prefill_events[-1] if prefill_events else None
     latest_decode = decode_events[-1] if decode_events else None
@@ -213,12 +237,18 @@ def _parse_sglang_runtime(lines: list[str]) -> dict[str, Any]:
 
 def _parse_naive_time(value: str) -> int | None:
     try:
-        return int(datetime.strptime(value, "%Y-%m-%d %H:%M:%S").timestamp())
+        return int(
+            datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
     except ValueError:
         return None
 
 
-def _parse_vllm_logs(lines: list[str]) -> dict[str, Any]:
+def _parse_vllm_logs(
+    lines: list[str], timezone_name: str | None = None
+) -> dict[str, Any]:
     latest_throughput: dict[str, Any] | None = None
     accept_rate = None
     errors = 0
@@ -238,7 +268,8 @@ def _parse_vllm_logs(lines: list[str]) -> dict[str, Any]:
                 "kv": float(values["kv"]),
                 "prefix": float(values["prefix"]),
                 "display_ts": _display_vllm_time(
-                    time_match.group("ts") if time_match else None
+                    time_match.group("ts") if time_match else None,
+                    timezone_name,
                 ),
             }
         match = VLLM_ACCEPT_RE.search(line)
@@ -263,10 +294,11 @@ def _arg_value(args: list[str], *names: str) -> str | None:
 
 
 class ModelMonitor:
-    def __init__(self, db: Database, settings: Settings):
+    def __init__(self, db: Database, config: Any):
         self.db = db
-        self.settings = settings
+        self.config = config
         self._lock = threading.Lock()
+        self._wake = threading.Event()
         self._overview_cache: tuple[float, dict[str, Any]] | None = None
         self._runtime_cache: tuple[float, dict[str, Any]] | None = None
         self._container_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
@@ -277,6 +309,10 @@ class ModelMonitor:
         self._counter_state: dict[str, tuple[float, dict[str, float]]] = {}
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
+
+    def _current(self) -> Any:
+        current = getattr(self.config, "current", None)
+        return current() if callable(current) else self.config
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -291,8 +327,12 @@ class ModelMonitor:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._wake.set()
         if self._worker:
             self._worker.join(timeout=2)
+
+    def notify_config_changed(self) -> None:
+        self._wake.set()
 
     def _sample_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -300,23 +340,37 @@ class ModelMonitor:
                 self.overview()
             except Exception:
                 pass
-            self._stop_event.wait(15)
+            self._wake.wait(float(self._current().model_sample_interval_seconds))
+            self._wake.clear()
 
     def _nodes(self) -> list[dict[str, Any]]:
         return sorted(self.db.list_nodes(), key=lambda node: int(node["id"]))
 
+    def _ssh_credentials(self, node: dict[str, Any]) -> dict[str, Any]:
+        credentials = self.db.get_node_credentials(int(node["id"]))
+        if not credentials:
+            raise SSHError("节点不存在或 SSH 凭据已被移除")
+        return credentials
+
     def _containers(self, node: dict[str, Any]) -> list[dict[str, str]]:
         host = str(node["host"])
+        config = self._current()
         now = time.monotonic()
         with self._lock:
             cached = self._container_cache.get(host)
-            if cached and now - cached[0] < 20:
+            if (
+                cached
+                and now - cached[0]
+                < float(config.model_cache_container_seconds)
+            ):
                 return cached[1]
         output = run_remote_command(
-            node,
-            self.settings,
-            ["docker", "ps", "--format", "{{.Names}}|{{.Image}}"],
-            timeout=8,
+            self._ssh_credentials(node),
+            config,
+            _container_command(
+                config, "ps", "--format", "{{.Names}}|{{.Image}}"
+            ),
+            timeout=float(config.model_ssh_timeout_seconds),
         )
         containers = []
         for line in output.splitlines():
@@ -332,9 +386,10 @@ class ModelMonitor:
         self, node: dict[str, Any], engine_hint: str | None = None
     ) -> dict[str, str] | None:
         containers = self._containers(node)
+        config = self._current()
         if not containers:
             return None
-        for hint in CONTAINER_HINTS:
+        for hint in config.model_container_hints:
             for container in containers:
                 if container["name"] == hint:
                     return container
@@ -344,7 +399,9 @@ class ModelMonitor:
             score = 0
             if engine_hint and engine_hint.lower() in searchable:
                 score += 30
-            if any(term in searchable for term in ("vllm", "sglang", "spark", "dsv", "ds41")):
+            if any(
+                term.lower() in searchable for term in config.model_engine_hints
+            ):
                 score += 10
             scored.append((score, container))
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -353,11 +410,14 @@ class ModelMonitor:
     def _container_process_args(
         self, node: dict[str, Any], container_name: str
     ) -> tuple[list[str], str]:
+        config = self._current()
         output = run_remote_command(
-            node,
-            self.settings,
-            ["docker", "top", container_name, "-eo", "pid,args"],
-            timeout=8,
+            self._ssh_credentials(node),
+            config,
+            _container_command(
+                config, "top", container_name, "-eo", "pid,args"
+            ),
+            timeout=float(config.model_ssh_timeout_seconds),
         )
         candidates: list[tuple[int, list[str], str]] = []
         for line in output.splitlines():
@@ -383,15 +443,21 @@ class ModelMonitor:
         return candidates[0][1], candidates[0][2]
 
     def _detect_runtime(self) -> dict[str, Any]:
+        config = self._current()
         now = time.monotonic()
         with self._lock:
-            if self._runtime_cache and now - self._runtime_cache[0] < 10:
+            if (
+                self._runtime_cache
+                and now - self._runtime_cache[0]
+                < float(config.model_cache_runtime_seconds)
+            ):
                 return self._runtime_cache[1]
         nodes = self._nodes()
+        default_port = int(config.model_default_port)
         if not nodes:
             return {
                 "nodes": [],
-                "port": MODEL_PORTS[0] if MODEL_PORTS else 8888,
+                "port": default_port,
                 "engine": "unknown",
                 "container": None,
                 "args": [],
@@ -409,11 +475,23 @@ class ModelMonitor:
                 )
             except SSHError:
                 pass
-        for port in MODEL_PORTS:
-            status, _ = _http_get(f"http://{head['host']}:{port}/health")
+        for port in config.model_ports:
+            status, _ = _http_get(
+                _http_endpoint(
+                    _model_base_url(config, head["host"], port),
+                    str(config.model_health_path),
+                ),
+                float(config.model_http_timeout_seconds),
+            )
             if status != 200:
                 continue
-            _, metrics = _http_get(f"http://{head['host']}:{port}/metrics", 5)
+            _, metrics = _http_get(
+                _http_endpoint(
+                    _model_base_url(config, head["host"], port),
+                    str(config.model_metrics_path),
+                ),
+                float(config.model_metrics_timeout_seconds),
+            )
             if "vllm:" in metrics:
                 engine = "vllm"
             elif "sglang:" in metrics:
@@ -434,7 +512,7 @@ class ModelMonitor:
             }
             break
         if selected is None:
-            port = MODEL_PORTS[0] if MODEL_PORTS else 8888
+            port = default_port
             engine = (
                 "vllm"
                 if "vllm" in process_text
@@ -459,17 +537,28 @@ class ModelMonitor:
     ) -> dict[str, Any]:
         if not container:
             return {"status": "not_found", "running": False, "name": "unknown"}
+        config = self._current()
         key = (str(head["host"]), container["name"])
         now = time.monotonic()
         with self._lock:
             cached = self._inspect_cache.get(key)
-            if cached and now - cached[0] < 5:
+            if (
+                cached
+                and now - cached[0]
+                < float(config.model_cache_inspect_seconds)
+            ):
                 return cached[1]
         state_raw = run_remote_command(
-            head,
-            self.settings,
-            ["docker", "inspect", "--format", "{{json .State}}", container["name"]],
-            timeout=8,
+            self._ssh_credentials(head),
+            config,
+            _container_command(
+                config,
+                "inspect",
+                "--format",
+                "{{json .State}}",
+                container["name"],
+            ),
+            timeout=float(config.model_ssh_timeout_seconds),
         )
         try:
             state = json.loads(state_raw.strip().splitlines()[-1])
@@ -501,11 +590,21 @@ class ModelMonitor:
     def _health_map(
         self, nodes: list[dict[str, Any]], port: int
     ) -> dict[int, bool]:
+        config = self._current()
         result: dict[int, bool] = {}
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(nodes)))) as executor:
+        with ThreadPoolExecutor(
+            max_workers=min(
+                int(config.model_health_concurrency), max(1, len(nodes))
+            )
+        ) as executor:
             futures = {
                 executor.submit(
-                    _http_get, f"http://{node['host']}:{port}/health", 2
+                    _http_get,
+                    _http_endpoint(
+                        _model_base_url(config, node["host"], port),
+                        str(config.model_health_path),
+                    ),
+                    float(config.model_http_timeout_seconds),
                 ): int(node["id"])
                 for node in nodes
             }
@@ -574,6 +673,7 @@ class ModelMonitor:
         }
 
     def _vllm_inference(self, metrics_text: str, logs: list[str]) -> dict[str, Any]:
+        config = self._current()
         samples = _prometheus_samples(metrics_text)
         prompt_total = _sum_metric(samples, "vllm:prompt_tokens_total") or 0.0
         generation_total = (
@@ -592,7 +692,7 @@ class ModelMonitor:
             now,
             {"prompt": prompt_total, "generation": generation_total},
         )
-        log_data = _parse_vllm_logs(logs)
+        log_data = _parse_vllm_logs(logs, config.model_timezone)
         log_throughput = log_data["log_throughput"] or {}
         if prefill_rate is None:
             prefill_rate = log_throughput.get("prompt")
@@ -659,11 +759,12 @@ class ModelMonitor:
             "last_prefill_at": log_throughput.get("display_ts"),
             "last_decode_at": log_throughput.get("display_ts"),
             "log_error_count": log_data["log_error_count"],
-            "metrics_source": "Prometheus /metrics",
+            "metrics_source": f"Prometheus {config.model_metrics_path}",
         }
 
     def _sglang_inference(self, metrics_text: str, logs: list[str]) -> dict[str, Any]:
-        log_data = _parse_sglang_runtime(logs)
+        config = self._current()
+        log_data = _parse_sglang_runtime(logs, config.model_timezone)
         samples = _prometheus_samples(metrics_text)
         metric_map = {
             "running_requests": "sglang:num_running_reqs",
@@ -703,9 +804,14 @@ class ModelMonitor:
         return log_data
 
     def overview(self) -> dict[str, Any]:
+        config = self._current()
         now = time.monotonic()
         with self._lock:
-            if self._overview_cache and now - self._overview_cache[0] < 4:
+            if (
+                self._overview_cache
+                and now - self._overview_cache[0]
+                < float(config.model_cache_overview_seconds)
+            ):
                 return self._overview_cache[1]
         runtime = self._detect_runtime()
         nodes = runtime["nodes"]
@@ -717,7 +823,11 @@ class ModelMonitor:
         health = self._health_map(nodes, port)
         if engine == "vllm":
             container_health: dict[int, bool] = {}
-            with ThreadPoolExecutor(max_workers=min(8, len(nodes))) as executor:
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    int(config.model_cluster_concurrency), max(1, len(nodes))
+                )
+            ) as executor:
                 futures = {}
                 for node in nodes:
                     selected = self._choose_container(node, "vllm")
@@ -750,7 +860,12 @@ class ModelMonitor:
                 "error": str(exc),
             }
         try:
-            head_logs = self._fetch_logs(head, 0, 800, container_info)
+            head_logs = self._fetch_logs(
+                head,
+                0,
+                int(config.model_overview_log_lines),
+                container_info,
+            )
         except SSHError:
             head_logs = []
         metrics_text = runtime.get("metrics") or ""
@@ -762,9 +877,13 @@ class ModelMonitor:
         process_started_at = inspected.get("started_at")
         inference["data_since"] = process_started_at
         inference["data_scope"] = "current_model_process"
+        history_minutes = int(config.model_history_minutes)
+        history_buckets = int(config.model_history_buckets)
         throughput_history = {
-            "window_minutes": 30,
-            "bucket_seconds": 60,
+            "window_minutes": history_minutes,
+            "bucket_seconds": max(
+                1, round(history_minutes * 60 / history_buckets)
+            ),
             "process_started_at": process_started_at,
             "points": [],
         }
@@ -777,8 +896,8 @@ class ModelMonitor:
             )
             throughput_history = self.db.load_model_throughput_history(
                 process_started_at,
-                minutes=30,
-                buckets=30,
+                minutes=history_minutes,
+                buckets=history_buckets,
             )
         config = self._config(runtime.get("args") or [], metrics)
         healthy = sum(1 for value in health.values() if value)
@@ -812,7 +931,7 @@ class ModelMonitor:
         result = {
             "status": status,
             "generated_at": int(time.time()),
-            "endpoint": f"http://{head['host']}:{port}",
+            "endpoint": _model_base_url(config, head["host"], port),
             "engine": engine,
             "engine_label": {"vllm": "vLLM", "sglang": "SGLang"}.get(engine, "Unknown"),
             "model": {
@@ -854,6 +973,7 @@ class ModelMonitor:
         container: dict[str, str] | None = None,
         use_cache: bool = True,
     ) -> list[str]:
+        config = self._current()
         selected = container or self._choose_container(node)
         if not selected:
             raise SSHError("no running model container found")
@@ -867,24 +987,35 @@ class ModelMonitor:
         if use_cache:
             with self._lock:
                 cached = self._logs_cache.get(key)
-                if cached and now - cached[0] < 4:
+                if (
+                    cached
+                    and now - cached[0]
+                    < float(config.model_cache_logs_seconds)
+                ):
                     return cached[1]
-        command = [
-            "docker",
+        requested_lines = max(
+            20,
+            min(
+                lines,
+                int(config.model_log_max_lines),
+            ),
+        )
+        command = _container_command(
+            config,
             "logs",
             "--tail",
-            str(max(20, min(lines, 1500))),
+            str(requested_lines),
             "--timestamps",
-        ]
+        )
         since = _docker_since(started_at)
         if since:
             command.extend(["--since", since])
         command.append(selected["name"])
         output = run_remote_command(
-            node,
-            self.settings,
+            self._ssh_credentials(node),
+            config,
             command,
-            timeout=12,
+            timeout=float(config.model_log_timeout_seconds),
         )
         result = output.splitlines()
         if use_cache:
@@ -892,15 +1023,25 @@ class ModelMonitor:
                 self._logs_cache[key] = (now, result)
         return result
 
-    def logs(self, rank: str = "0", lines: int = 220) -> dict[str, Any]:
+    def logs(self, rank: str = "0", lines: int | None = None) -> dict[str, Any]:
+        config = self._current()
+        requested_lines = int(
+            lines if lines is not None else config.model_log_lines
+        )
         nodes = self._nodes()
         if not nodes:
             return {"generated_at": int(time.time()), "lines": []}
         if rank == "all":
             output: list[str] = []
-            with ThreadPoolExecutor(max_workers=min(8, len(nodes))) as executor:
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    int(config.model_cluster_concurrency), max(1, len(nodes))
+                )
+            ) as executor:
                 futures = {
-                    executor.submit(self._fetch_logs, node, index, lines): (index, node)
+                    executor.submit(
+                        self._fetch_logs, node, index, requested_lines
+                    ): (index, node)
                     for index, node in enumerate(nodes)
                 }
                 sections: dict[int, list[str]] = {}
@@ -917,7 +1058,7 @@ class ModelMonitor:
             return {
                 "generated_at": int(time.time()),
                 "rank": "all",
-                "lines": output[-min(1200, len(output)):],
+                "lines": output[-min(int(config.model_log_all_limit), len(output)):],
             }
         try:
             index = max(0, min(len(nodes) - 1, int(rank)))
@@ -926,7 +1067,7 @@ class ModelMonitor:
         node = nodes[index]
         try:
             lines_out = self._fetch_logs(
-                node, index, lines, use_cache=False
+                node, index, requested_lines, use_cache=False
             )
         except SSHError as exc:
             lines_out = [f"ERROR {exc}"]

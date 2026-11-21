@@ -1676,9 +1676,16 @@ svg {
 
 .scan-meta {
   display: flex;
+  flex-wrap: wrap;
   gap: 18px;
   color: var(--muted);
   font: 9px/1 Consolas, monospace;
+}
+
+.scan-error {
+  color: #e88989;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .scan-progress {
@@ -1696,7 +1703,20 @@ svg {
 
 .scan-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 8px;
+}
+
+.scan-actions .scan-interface {
+  width: 260px;
+  max-width: 100%;
+}
+
+.scan-actions .text-input {
+  width: 160px;
+  min-width: 130px;
+  flex: 1 1 130px;
 }
 
 .discovery-note {
@@ -1883,14 +1903,29 @@ svg {
   font: 9px/1 Consolas, monospace;
 }
 
-.settings-grid {
+.settings-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(300px, 0.7fr);
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.34fr);
+  align-items: start;
   gap: 14px;
+}
+
+.settings-groups {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
 }
 
 .settings-card {
   overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.settings-group {
+  overflow: hidden;
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--panel);
@@ -1916,33 +1951,107 @@ svg {
   padding: 16px;
 }
 
-.threshold-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
+.settings-side {
+  position: sticky;
+  top: calc(var(--topbar-height) + 14px);
+  min-width: 0;
 }
 
-.threshold-field {
+.settings-fields {
   display: grid;
-  gap: 7px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.threshold-field > span {
+.setting-field {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  gap: 6px;
+  padding: 14px 16px 15px;
+  border-top: 1px solid var(--line-soft);
+  transition: background 160ms ease;
+}
+
+.setting-field:nth-child(odd) {
+  border-right: 1px solid var(--line-soft);
+}
+
+.setting-field:hover {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.setting-field.is-wide {
+  grid-column: 1 / -1;
+  border-right: 0;
+}
+
+.setting-label-row {
   display: flex;
+  align-items: baseline;
   justify-content: space-between;
-  color: var(--muted-strong);
-  font-size: 10px;
+  gap: 12px;
+  min-width: 0;
 }
 
-.threshold-field input {
+.setting-label-row strong {
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.setting-label-row small {
+  flex: 0 0 auto;
+  color: #81918a;
+  font: 9px/1.2 Consolas, monospace;
+}
+
+.setting-description {
+  color: var(--muted-strong);
+  font-size: 9px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.setting-input {
   width: 100%;
   height: 38px;
+  min-width: 0;
   padding: 0 10px;
   color: var(--text);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 5px;
   background: #101415;
   font: 11px/1 Consolas, monospace;
+}
+
+.setting-input:focus {
+  border-color: #417b56;
+  outline: 2px solid rgba(69, 209, 122, 0.12);
+  outline-offset: 0;
+}
+
+.setting-toggle-control {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  color: var(--muted-strong);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.setting-checkbox {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--green);
+}
+
+.path-value {
+  max-width: 72%;
+  overflow-wrap: anywhere;
+  text-align: right;
+  font: 9px/1.5 Consolas, monospace;
 }
 
 .settings-actions {
@@ -3117,6 +3226,44 @@ svg {
   line-height: 1.5;
 }
 
+.credential-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  padding: 4px 7px;
+  color: #748078;
+  border: 1px solid #28302d;
+  border-radius: 5px;
+  background: #0e1213;
+  font: 9px/1 Consolas, monospace;
+}
+
+.credential-state svg {
+  width: 12px;
+  height: 12px;
+}
+
+.credential-state.configured {
+  color: #8ddca7;
+  border-color: #294535;
+  background: #121d16;
+}
+
+.checkbox-field {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.checkbox-field .checkbox {
+  flex: 0 0 auto;
+}
+
 .modal-error {
   margin-top: 12px;
 }
@@ -3199,8 +3346,12 @@ svg {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
-  .settings-grid {
+  .settings-layout {
     grid-template-columns: 1fr;
+  }
+
+  .settings-side {
+    position: static;
   }
 
   .model-kpi-grid {
@@ -3317,13 +3468,17 @@ svg {
     grid-template-columns: 1fr;
   }
 
-  .threshold-grid,
+  .settings-fields,
   .form-grid,
   .detail-grid,
   .model-kpi-grid,
   .model-config-grid,
   .model-runtime-grid {
     grid-template-columns: 1fr;
+  }
+
+  .setting-field:nth-child(odd) {
+    border-right: 0;
   }
 
   .model-log-actions .text-input {
@@ -3419,6 +3574,12 @@ svg {
 
   .scan-actions {
     flex-wrap: wrap;
+  }
+
+  .scan-actions .scan-interface,
+  .scan-actions .text-input {
+    width: 100%;
+    flex: 1 1 100%;
   }
 
   .drawer-hero {

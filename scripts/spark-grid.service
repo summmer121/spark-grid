@@ -1,3 +1,4 @@
+# Reference template. Use scripts/install_service.sh to generate the active unit.
 [Unit]
 Description=Spark Grid monitoring center
 After=network-online.target
@@ -5,9 +6,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/spark-monitor
-EnvironmentFile=-%h/spark-monitor/.env
-ExecStart=/usr/bin/python3 -m app.main
+WorkingDirectory="@SPARK_ROOT@"
+EnvironmentFile=-"@SPARK_ENV_FILE@"
+ExecStart="@SPARK_PYTHON@" -m app.main
 Restart=always
 RestartSec=3
 NoNewPrivileges=yes

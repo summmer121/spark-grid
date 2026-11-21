@@ -9,7 +9,6 @@ import time
 from collections import defaultdict, deque
 from typing import Any
 
-from .config import settings
 from .db import Database
 
 
@@ -52,10 +51,11 @@ def create_session(
     user_id: int,
     remote_addr: str,
     user_agent: str,
+    session_ttl_hours: int,
 ) -> tuple[str, dict[str, Any]]:
     token = secrets.token_urlsafe(32)
     csrf_token = secrets.token_urlsafe(24)
-    expires_at = int(time.time()) + settings.session_ttl_hours * 3600
+    expires_at = int(time.time()) + max(1, session_ttl_hours) * 3600
     db.create_session(
         token_hash(token),
         user_id,
@@ -71,23 +71,29 @@ def create_session(
 
 
 class LoginThrottle:
-    def __init__(self, max_attempts: int = 8, window_seconds: int = 600):
-        self.max_attempts = max_attempts
-        self.window_seconds = window_seconds
+    def __init__(self) -> None:
         self._attempts: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
-    def allowed(self, remote_addr: str) -> bool:
+    def allowed(
+        self, remote_addr: str, max_attempts: int, window_seconds: int
+    ) -> bool:
         now = time.monotonic()
         with self._lock:
             attempts = self._attempts[remote_addr]
-            while attempts and now - attempts[0] > self.window_seconds:
+            while attempts and now - attempts[0] > max(1, window_seconds):
                 attempts.popleft()
-            return len(attempts) < self.max_attempts
+            return len(attempts) < max(1, max_attempts)
 
-    def record_failure(self, remote_addr: str) -> None:
+    def record_failure(
+        self, remote_addr: str, window_seconds: int = 600
+    ) -> None:
+        now = time.monotonic()
         with self._lock:
-            self._attempts[remote_addr].append(time.monotonic())
+            attempts = self._attempts[remote_addr]
+            while attempts and now - attempts[0] > max(1, window_seconds):
+                attempts.popleft()
+            attempts.append(now)
 
     def reset(self, remote_addr: str) -> None:
         with self._lock:

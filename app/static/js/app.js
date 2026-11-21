@@ -4,12 +4,23 @@
   const state = {
     user: null,
     csrf: null,
+    version: "",
     setupRequired: false,
     authMode: "login",
     dashboard: null,
     discovery: null,
     audit: [],
     settings: null,
+    settingsFields: [],
+    settingsGroups: [],
+    settingsProcess: null,
+    sshDefaults: {
+      user: "",
+      port: null,
+      key_path: "",
+      key_path_configured: false,
+      password_supported: false,
+    },
     modelOverview: null,
     modelLogs: [],
     modelRank: "0",
@@ -30,7 +41,9 @@
     clusterHistoryLoadedAt: 0,
     confirmAction: null,
     pollBusy: false,
+    pollTimer: null,
     discoveryBusy: false,
+    scanInterface: "",
   };
 
   const viewMeta = {
@@ -40,7 +53,7 @@
     discovery: { eyebrow: "LAN DISCOVERY", title: "局域网发现" },
     alerts: { eyebrow: "ALERT CENTER", title: "告警中心" },
     audit: { eyebrow: "OPERATION AUDIT", title: "操作审计" },
-    settings: { eyebrow: "MONITOR SETTINGS", title: "监控设置" },
+    settings: { eyebrow: "SYSTEM SETTINGS", title: "系统设置" },
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -120,6 +133,79 @@
     return Number.isFinite(number) ? `${number.toFixed(digits)}%` : "—";
   }
 
+  function settingValue(key, fallback = null) {
+    const value = state.settings?.[key];
+    return value === undefined || value === null || value === "" ? fallback : value;
+  }
+
+  function browserTimezone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    } catch (_error) {
+      return "UTC";
+    }
+  }
+
+  function displayTimezone() {
+    return String(settingValue("ui_timezone", browserTimezone()));
+  }
+
+  function defaultGroupName() {
+    return String(settingValue("default_group_name", "未分组"));
+  }
+
+  function gpuFallbackName() {
+    return String(settingValue("ui_gpu_fallback_name", "GPU"));
+  }
+
+  function configuredHistoryRanges() {
+    const field = state.settingsFields.find((item) => item.key === "ui_history_ranges");
+    const minimum = Number(field?.min);
+    const maximum = Number(field?.max);
+    const values = Array.isArray(settingValue("ui_history_ranges", []))
+      ? settingValue("ui_history_ranges", [])
+      : [];
+    const ranges = values
+      .map((value) => Number(value))
+      .filter(
+        (value) =>
+          Number.isInteger(value) &&
+          (!Number.isFinite(minimum) || value >= minimum) &&
+          (!Number.isFinite(maximum) || value <= maximum),
+      );
+    if (ranges.length) return Array.from(new Set(ranges)).sort((a, b) => a - b);
+    const fallback = [
+      Number.isFinite(minimum) ? minimum : null,
+      Number(settingValue("ui_history_minutes", NaN)),
+    ]
+      .filter((value) => Number.isInteger(value) && value > 0)
+      .filter(
+        (value) =>
+          (!Number.isFinite(maximum) || value <= maximum),
+      );
+    return Array.from(new Set(fallback)).sort((a, b) => a - b);
+  }
+
+  function formatHistoryRange(minutes) {
+    const value = Math.max(1, Number(minutes) || 1);
+    if (value % 1440 === 0) return `${value / 1440} 天`;
+    if (value % 60 === 0) return `${value / 60} 小时`;
+    return `${value} 分钟`;
+  }
+
+  function formatPointInterval(seconds) {
+    const value = Math.max(1, Number(seconds) || 1);
+    if (value % 3600 === 0) return `${value / 3600} HOUR / POINT`;
+    if (value % 60 === 0) return `${value / 60} MIN / POINT`;
+    return `${value} SEC / POINT`;
+  }
+
+  function gpuLoadLabel(gpu) {
+    return gpu?.load_source === "power estimate"
+      ? "GPU LOAD · POWER EST."
+      : "GPU LOAD";
+  }
+
   function formatBytes(value, suffix = "") {
     const number = Number(value);
     if (!Number.isFinite(number)) return "—";
@@ -155,6 +241,7 @@
       minute: "2-digit",
       second: "2-digit",
       hour12: false,
+      timeZone: displayTimezone(),
     }).format(new Date(timestamp * 1000));
   }
 
@@ -164,6 +251,7 @@
       hour: "2-digit",
       minute: "2-digit",
       hour12: false,
+      timeZone: displayTimezone(),
     }).format(new Date(timestamp * 1000));
   }
 
@@ -176,6 +264,7 @@
       minute: "2-digit",
       second: "2-digit",
       hour12: false,
+      timeZone: displayTimezone(),
     }).format(new Date(timestamp * 1000));
   }
 
@@ -184,7 +273,7 @@
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return "—";
     return new Intl.DateTimeFormat("zh-CN", {
-      timeZone: "Asia/Shanghai",
+      timeZone: displayTimezone(),
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
@@ -207,7 +296,7 @@
   }
 
   function timeAgo(timestamp) {
-    if (!timestamp) return "从未上报";
+    if (!timestamp) return "从未采集";
     const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
     if (seconds < 10) return "刚刚";
     if (seconds < 60) return `${seconds} 秒前`;
@@ -302,6 +391,108 @@
     }
   }
 
+  function sshDefaults() {
+    const defaults = state.sshDefaults || {};
+    const port = Number(defaults.port);
+    return {
+      user: String(defaults.user || "").trim(),
+      port: Number.isInteger(port) && port > 0 ? port : "",
+      keyPath: String(defaults.key_path || "").trim(),
+      keyPathConfigured: Boolean(defaults.key_path_configured),
+      passwordSupported: Boolean(defaults.password_supported),
+    };
+  }
+
+  function sshAddress(user, host, port) {
+    const defaults = sshDefaults();
+    const resolvedUser = String(user || defaults.user || "").trim();
+    const resolvedPort = Number(port || defaults.port || 0);
+    return `${resolvedUser || "未配置用户"}@${host || "—"}${resolvedPort ? `:${resolvedPort}` : ""}`;
+  }
+
+  function sshCredentialFields({
+    passwordHint = "留空时将复用该节点已保存的密码；没有已保存密码时使用私钥或 SSH Agent。",
+    keyPlaceholder = "留空使用中心端 SSH 配置",
+    user,
+    port,
+    keyPath,
+    passwordConfigured = false,
+    allowClearPassword = false,
+  } = {}) {
+    const defaults = sshDefaults();
+    const resolvedUser = user === undefined ? defaults.user : String(user || "").trim();
+    const requestedPort = port === undefined ? defaults.port : Number(port);
+    const resolvedPort = Number.isInteger(requestedPort) && requestedPort > 0 ? requestedPort : "";
+    const resolvedKeyPath = keyPath === undefined ? defaults.keyPath : String(keyPath || "").trim();
+    const keyHint = resolvedKeyPath
+      ? "此路径优先于中心端默认私钥。"
+      : defaults.keyPathConfigured
+        ? "中心端已配置默认私钥，留空即可使用。"
+        : "可填写中心节点上的私钥文件路径。";
+    const passwordStatus = passwordConfigured
+      ? `<span class="credential-state configured">${icon("key-round")}<span>已保存加密密码</span></span>`
+      : `<span class="credential-state">${icon("key-round")}<span>未保存密码</span></span>`;
+    const clearPassword = allowClearPassword && passwordConfigured
+      ? `
+        <label class="checkbox-field full">
+          <input class="checkbox" name="clear_ssh_password" type="checkbox">
+          <span>清除已保存的 SSH 密码</span>
+        </label>
+      `
+      : "";
+    return `
+      <label class="field"><span>SSH 用户</span><input class="text-input" name="ssh_user" value="${escapeHtml(resolvedUser)}" placeholder="SSH 登录用户" required></label>
+      <label class="field"><span>SSH 端口</span><input class="text-input" name="ssh_port" type="number" min="1" max="65535" value="${resolvedPort}" placeholder="默认 22"></label>
+      <label class="field full"><span>私钥路径</span><input class="text-input" name="ssh_key_path" value="${escapeHtml(resolvedKeyPath)}" placeholder="${escapeHtml(keyPlaceholder)}"><span class="field-hint">${escapeHtml(keyHint)}</span></label>
+      <label class="field full"><span>SSH 密码</span><input class="text-input" name="ssh_password" type="password" autocomplete="new-password" placeholder="${passwordConfigured ? "留空保持当前密码" : "留空则使用私钥认证"}"><span class="field-hint">${escapeHtml(passwordHint)}</span>${passwordStatus}</label>
+      ${clearPassword}
+    `;
+  }
+
+  function applySettingsPayload(payload, resetHistoryDefault = false) {
+    if (payload?.settings) state.settings = payload.settings;
+    if (Array.isArray(payload?.fields)) state.settingsFields = payload.fields;
+    if (Array.isArray(payload?.groups)) state.settingsGroups = payload.groups;
+    if (payload?.process) state.settingsProcess = payload.process;
+    if (payload?.ssh_defaults) {
+      const defaults = payload.ssh_defaults;
+      state.sshDefaults = {
+        user: String(defaults.user || ""),
+        port: Number(defaults.port) || null,
+        key_path: String(defaults.key_path || ""),
+        key_path_configured: Boolean(defaults.key_path_configured),
+        password_supported: Boolean(defaults.password_supported),
+      };
+    }
+    if (state.dashboard && state.settings) {
+      state.dashboard.thresholds = Object.fromEntries(
+        state.settingsFields
+          .filter((field) => field.group === "alerts")
+          .map((field) => [field.key, state.settings[field.key]]),
+      );
+      state.dashboard.dashboard_refresh_seconds = state.settings.dashboard_refresh_seconds;
+      state.dashboard.poll_interval = state.settings.poll_interval;
+    }
+    const configuredDefault = Number(state.settings?.ui_history_minutes);
+    if (resetHistoryDefault && Number.isFinite(configuredDefault) && configuredDefault >= 5) {
+      state.historyRange = configuredDefault;
+    } else if (!configuredHistoryRanges().includes(state.historyRange)) {
+      state.historyRange = configuredHistoryRanges()[0];
+    }
+  }
+
+  async function loadSettings(resetHistoryDefault = false) {
+    try {
+      const payload = await api("/api/settings");
+      applySettingsPayload(payload, resetHistoryDefault);
+      if (state.view === "settings" && state.settings) renderCurrentView();
+    } catch (error) {
+      if (error.status !== 401) {
+        showToast(`系统设置加载失败：${error.message}`, "error");
+      }
+    }
+  }
+
   function configureAuth(mode) {
     state.authMode = mode;
     const setup = mode === "setup";
@@ -345,6 +536,7 @@
     bindEvents();
     try {
       const bootstrap = await api("/api/bootstrap");
+      state.version = String(bootstrap.version || "");
       state.setupRequired = bootstrap.setup_required;
       if (bootstrap.setup_required) {
         showAuth("setup");
@@ -355,7 +547,7 @@
         state.user = session.user;
         state.csrf = session.csrf_token;
         showApp();
-        await loadDashboard();
+        await Promise.all([loadSettings(true), loadDashboard()]);
         startPolling();
       } catch (error) {
         if (error.status === 401) showAuth("login");
@@ -373,26 +565,53 @@
   }
 
   function startPolling() {
-    window.setInterval(async () => {
-      if (!state.user || document.hidden || state.pollBusy) return;
+    if (state.pollTimer !== null) {
+      window.clearTimeout(state.pollTimer);
+      state.pollTimer = null;
+    }
+    const interval = Math.max(
+      2,
+      Number(
+        state.dashboard?.dashboard_refresh_seconds ||
+          settingValue("dashboard_refresh_seconds", 5),
+      ) || 5,
+    );
+    state.pollTimer = window.setTimeout(async () => {
+      if (!state.user || document.hidden || state.pollBusy) {
+        startPolling();
+        return;
+      }
       state.pollBusy = true;
       try {
         await loadDashboard(true);
-        if (Date.now() - state.clusterHistoryLoadedAt > 60000) {
-          await loadClusterHistory(30);
+        const clusterHistoryRefresh =
+          Math.max(
+            10,
+            Number(
+              settingValue("ui_cluster_history_refresh_seconds", 60),
+            ) || 60,
+          ) * 1000;
+        if (Date.now() - state.clusterHistoryLoadedAt > clusterHistoryRefresh) {
+          await loadClusterHistory(state.historyRange);
         }
         if (state.view === "discovery") await loadDiscovery(true);
         if (state.view === "audit") await loadAudit(true);
         if (state.view === "model") {
           await loadModelOverview(true);
-          if (Date.now() - (state.modelLogsUpdatedAt || 0) > 10000) {
+          const logRefresh =
+            Math.max(
+              2,
+              Number(settingValue("ui_model_log_refresh_seconds", 10)) || 10,
+            ) * 1000;
+          if (Date.now() - (state.modelLogsUpdatedAt || 0) > logRefresh) {
             await loadModelLogs(true);
           }
         }
       } finally {
         state.pollBusy = false;
+        startPolling();
       }
-    }, 5000);
+    }, interval * 1000);
   }
 
   async function loadDashboard(silent = false) {
@@ -414,7 +633,7 @@
         }
       }
       if (!state.clusterHistory && !state.clusterHistoryLoading) {
-        loadClusterHistory(30);
+        loadClusterHistory(state.historyRange);
       }
     } catch (error) {
       if (error.status !== 401) showToast(error.message, "error");
@@ -428,7 +647,7 @@
     else if (state.view === "alerts") patchAlerts();
   }
 
-  async function loadClusterHistory(minutes = 30) {
+  async function loadClusterHistory(minutes = state.historyRange) {
     if (state.clusterHistoryLoading) return;
     state.clusterHistoryLoading = true;
     try {
@@ -481,7 +700,8 @@
 
   function renderCurrentView() {
     const content = $("#content");
-    if (!state.dashboard && state.view !== "audit") {
+    const settingsReady = state.view === "settings" && state.settings;
+    if (!state.dashboard && state.view !== "audit" && !settingsReady) {
       content.innerHTML = loadingView();
       return;
     }
@@ -732,8 +952,8 @@
     const tagsElement = $("[data-node-tags]", card);
     if (tagsElement) {
       tagsElement.innerHTML = `
-        <span class="tag accent">${escapeHtml(gpus[0]?.name || "GB10")}</span>
-        <span class="tag">${escapeHtml(node.group_name || "未分组")}</span>
+        <span class="tag accent">${escapeHtml(gpus[0]?.name || gpuFallbackName())}</span>
+        <span class="tag">${escapeHtml(node.group_name || defaultGroupName())}</span>
         ${temperature ? `<span class="tag ${temperature >= 80 ? "warn" : ""}">${temperature.toFixed(0)}°C</span>` : ""}
         ${tags.slice(0, 1).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}
       `;
@@ -833,8 +1053,8 @@
     const seen = $("[data-row-seen]", row);
     if (name) name.textContent = node.name;
     if (state) state.textContent = statusLabel(node.status);
-    if (address) address.textContent = `${node.ssh_user || "spark"}@${node.host}:${node.ssh_port || 22}`;
-    if (group) group.textContent = node.group_name || "未分组";
+    if (address) address.textContent = sshAddress(node.ssh_user, node.host, node.ssh_port);
+    if (group) group.textContent = node.group_name || defaultGroupName();
     if (tags) {
       const nodeTags = (node.tags || []).slice(0, 3);
       tags.innerHTML = nodeTags.length
@@ -898,7 +1118,7 @@
     const { resources, gpus, gpu } = nodeMetrics(node);
     const status = node.status || "unknown";
     const tags = Array.isArray(node.tags) ? node.tags : [];
-    const gpuLabel = gpus[0]?.name || "GB10";
+    const gpuLabel = gpus[0]?.name || gpuFallbackName();
     const temperature = Number(resources.temperature_max || 0);
     const latency = node.last_latency_ms;
     return `
@@ -916,13 +1136,13 @@
         </div>
         <div class="node-tags" data-node-tags>
           <span class="tag accent">${escapeHtml(gpuLabel)}</span>
-          <span class="tag">${escapeHtml(node.group_name || "未分组")}</span>
+          <span class="tag">${escapeHtml(node.group_name || defaultGroupName())}</span>
           ${temperature ? `<span class="tag ${temperature >= 80 ? "warn" : ""}">${temperature.toFixed(0)}°C</span>` : ""}
           ${tags.slice(0, 1).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}
         </div>
         <div class="node-primary-metric">
           <div>
-            <div class="metric-line"><span title="GB10 按功耗估算">GPU LOAD</span><strong data-node-gpu style="color:${metricColor(gpu)}">${formatPercent(gpu)}</strong></div>
+            <div class="metric-line"><span title="${escapeHtml(gpus[0]?.load_source === "power estimate" ? "按功耗与 P-State 估算" : "GPU 驱动利用率")}">${escapeHtml(gpuLoadLabel(gpus[0]))}</span><strong data-node-gpu style="color:${metricColor(gpu)}">${formatPercent(gpu)}</strong></div>
             <div class="bar-track"><i data-node-gpu-bar style="width:${Math.min(100, Number(gpu) || 0)}%;background:${metricColor(gpu)}"></i></div>
           </div>
           <div>
@@ -934,9 +1154,9 @@
           <div class="mini-metric"><span>CPU</span><strong data-node-cpu>${formatPercent(resources.cpu_percent)}</strong></div>
           <div class="mini-metric"><span>内存</span><strong data-node-memory-used>${formatBytes(resources.memory_used)}</strong></div>
         </div>
-        <div class="node-chart-head"><span>GPU 负载趋势</span><span>近 30 分钟 · 0–100%</span></div>
+        <div class="node-chart-head"><span>GPU 负载趋势</span><span>近 ${escapeHtml(formatHistoryRange(settingValue("ui_history_minutes", 30)))} · 0–100%</span></div>
         <div class="node-chart-wrap">
-          <canvas class="node-chart" data-chart-node="${node.id}" aria-label="${escapeHtml(node.name)} 最近三十分钟 GPU 负载趋势"></canvas>
+          <canvas class="node-chart" data-chart-node="${node.id}" aria-label="${escapeHtml(node.name)} 最近 ${escapeHtml(formatHistoryRange(settingValue("ui_history_minutes", 30)))} GPU 负载趋势"></canvas>
           <div class="node-chart-tooltip" data-node-chart-tooltip hidden></div>
         </div>
         <div class="node-net">
@@ -1225,7 +1445,7 @@
 
   function renderNodes() {
     const nodes = state.dashboard?.nodes || [];
-    const groups = Array.from(new Set(nodes.map((node) => node.group_name || "未分组")));
+    const groups = Array.from(new Set(nodes.map((node) => node.group_name || defaultGroupName())));
     const filtered = nodes.filter((node) => {
       const haystack = [node.name, node.host, node.group_name, ...(node.tags || [])]
         .join(" ")
@@ -1259,7 +1479,7 @@
             <thead>
               <tr>
                 <th><input class="checkbox" id="selectAllNodes" type="checkbox" ${filtered.length && filtered.every((node) => state.selectedNodes.has(node.id)) ? "checked" : ""} aria-label="全选"></th>
-                <th>节点</th><th>地址</th><th>分组</th><th>标签</th><th>GPU 负载</th><th>CPU</th><th>内存</th><th>GPU 温度</th><th>心跳</th><th></th>
+                <th>节点</th><th>地址</th><th>分组</th><th>标签</th><th>GPU 负载</th><th>CPU</th><th>内存</th><th>GPU 温度</th><th>最近采集</th><th></th>
               </tr>
             </thead>
             <tbody>${nodeRows}</tbody>
@@ -1305,8 +1525,8 @@
               <div><strong data-row-name>${escapeHtml(node.name)}</strong><span data-row-state>${statusLabel(node.status)}</span></div>
           </div>
         </td>
-        <td class="host-mono" data-row-address>${escapeHtml(node.ssh_user || "spark")}@${escapeHtml(node.host)}:${node.ssh_port || 22}</td>
-        <td data-row-group>${escapeHtml(node.group_name || "未分组")}</td>
+        <td class="host-mono" data-row-address>${escapeHtml(sshAddress(node.ssh_user, node.host, node.ssh_port))}</td>
+        <td data-row-group>${escapeHtml(node.group_name || defaultGroupName())}</td>
         <td><div class="tags-cell" data-row-tags>${tags.length ? tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("") : '<span class="last-update">—</span>'}</div></td>
         <td class="metric-mono" data-row-gpu>${formatPercent(gpu)}</td>
         <td class="metric-mono" data-row-cpu>${formatPercent(resources.cpu_percent)}</td>
@@ -1337,25 +1557,71 @@
     }
   }
 
+  function discoveryItemStatus(item) {
+    const info = item.info || {};
+    if (item.managed) {
+      return { label: "已纳管", className: "accent", detail: "" };
+    }
+    if (info.authenticated === true) {
+      return { label: "已认证待纳管", className: "accent", detail: "" };
+    }
+    if (info.ssh_error) {
+      return {
+        label: "SSH 认证失败",
+        className: "warn",
+        detail: String(info.ssh_error),
+      };
+    }
+    return { label: "已发现未认证", className: "", detail: "" };
+  }
+
   function renderDiscovery() {
-    const discovery = state.discovery || { discovered: [], scan: {} };
+    const discovery = state.discovery || { discovered: [], scan: {}, interfaces: [] };
     const scan = discovery.scan || {};
     const items = discovery.discovered || [];
+    const interfaces = discovery.interfaces || [];
+    if (state.scanInterface && !interfaces.some((item) => item.name === state.scanInterface)) {
+      state.scanInterface = "";
+    }
     const progress = scan.total ? (scan.scanned / scan.total) * 100 : 0;
-    const scanLabel = scan.scanning ? "正在扫描局域网" : scan.finished_at ? "扫描完成" : "等待扫描";
+    const scanLabel = scan.scanning
+      ? "正在扫描局域网"
+      : scan.error
+        ? "扫描范围不可用"
+        : scan.finished_at
+          ? "扫描完成"
+          : "等待扫描";
+    const interfaceOptions = [
+      `<option value="">${interfaces.length ? "自动选择全部可用网卡" : "未检测到 IPv4 网卡"}</option>`,
+      ...interfaces.map((item) => `
+        <option value="${escapeHtml(item.name)}" ${state.scanInterface === item.name ? "selected" : ""}>
+          ${escapeHtml(item.name)} · ${escapeHtml(item.address)} · ${escapeHtml(item.cidr)}${item.physical ? "" : " · 虚拟"}
+        </option>
+      `),
+    ].join("");
+    const scanInterfaces = scan.interface
+      ? `网卡 ${scan.interface}`
+      : (scan.interfaces || []).length
+        ? `网卡 ${(scan.interfaces || []).join(" · ")}`
+        : "自动识别网卡";
     const selectedCount = state.selectedDiscovery.size;
     const discoveryRows = items
       .map((item) => {
             const info = item.info || {};
             const selected = state.selectedDiscovery.has(item.host);
+            const canImport = info.authenticated === true;
+            const status = discoveryItemStatus(item);
             return `
               <tr>
-                <td><input class="checkbox discovery-select" type="checkbox" data-discovery-host="${escapeHtml(item.host)}" ${selected ? "checked" : ""} ${item.managed ? "disabled" : ""} aria-label="选择 ${escapeHtml(item.host)}"></td>
+                <td><input class="checkbox discovery-select" type="checkbox" data-discovery-host="${escapeHtml(item.host)}" ${selected ? "checked" : ""} ${!canImport || item.managed ? "disabled" : ""} aria-label="选择 ${escapeHtml(item.host)}"></td>
                 <td class="host-mono">${escapeHtml(item.host)}</td>
                 <td><strong>${escapeHtml(item.name || info.hostname || item.host)}</strong></td>
                 <td class="metric-mono">${escapeHtml(item.machine_id || "—")}</td>
-                <td class="metric-mono">${escapeHtml(item.ssh_user || "spark")}@${item.ssh_port || 22}</td>
-                <td>${item.managed ? '<span class="tag accent">已纳管</span>' : '<span class="tag warn">待纳管</span>'}</td>
+                <td class="metric-mono">${escapeHtml(sshAddress(item.ssh_user, item.host, item.ssh_port))}</td>
+                <td>
+                  <span class="tag ${escapeHtml(status.className)}">${escapeHtml(status.label)}</span>
+                  ${status.detail ? `<span class="discovery-status-detail" title="${escapeHtml(status.detail)}">${escapeHtml(status.detail)}</span>` : ""}
+                </td>
                 <td class="last-update">${timeAgo(item.last_seen)}</td>
               </tr>
             `;
@@ -1370,25 +1636,37 @@
           </table>
         </div>
       `
-      : emptyState("radar", "还没有发现节点", "中心服务会主动扫描本机网段的 SSH 资产。", "立即扫描", "scan-network-inline");
+      : emptyState("radar", "还没有发现节点", "选择本机网卡后扫描对应 IPv4 网段。", "立即扫描", "scan-network-inline");
     $("#content").innerHTML = `
       ${pageHead("自动发现与批量纳管", `${items.length} 个发现结果`, `<button class="button secondary compact" data-action="refresh-discovery">${icon("refresh-cw")}<span>刷新</span></button>`)}
       <div class="scan-panel">
         <div class="scan-main">
           <div class="scan-title">${icon(scan.scanning ? "loader-circle" : "radar")}<span>${scanLabel}</span></div>
+          ${scan.error ? `<div class="scan-error">${escapeHtml(scan.error)}</div>` : ""}
           <div class="scan-progress"><i style="width:${progress}%"></i></div>
           <div class="scan-meta">
             <span>${scan.scanned || 0} / ${scan.total || 0} HOSTS</span>
             <span>${scan.found || 0} FOUND</span>
-            <span>${escapeHtml((scan.subnets || []).join(" · ") || "本机管理网段")}</span>
+            <span>${scan.authenticated || 0} AUTH</span>
+            ${scan.probe_failures ? `<span>${scan.probe_failures} AUTH FAILED</span>` : ""}
+            <span>${escapeHtml(scanInterfaces)}</span>
+            <span>${escapeHtml((scan.subnets || []).join(" · ") || "等待选择范围")}</span>
           </div>
         </div>
-        <form class="scan-actions" id="scanForm">
-          <input class="text-input" id="scanCidrs" placeholder="CIDR，可留空" style="width:180px">
-          <button class="primary-button compact" type="submit" ${scan.scanning ? "disabled" : ""}>${icon("scan-line")}<span>${scan.scanning ? "扫描中" : "开始扫描"}</span></button>
+        <form class="scan-form" id="scanForm">
+          <div class="scan-actions">
+            <select class="select scan-interface" id="scanInterface" name="interface" aria-label="扫描网卡">${interfaceOptions}</select>
+            <input class="text-input" id="scanCidrs" name="scanCidrs" placeholder="可选 CIDR 覆盖">
+            <button class="primary-button compact" type="submit" ${scan.scanning ? "disabled" : ""}>${icon("scan-line")}<span>${scan.scanning ? "扫描中" : "开始扫描"}</span></button>
+          </div>
+          <div class="scan-credentials form-grid">
+            ${sshCredentialFields({
+              passwordHint: "密码只用于本次扫描和成功后的加密保存；留空时优先复用已保存凭据。",
+            })}
+          </div>
         </form>
       </div>
-      <div class="discovery-note">${icon("info")}<span>扫描范围默认包含本机管理网段；仅对已配置 SSH 信任的主机返回资产信息。</span></div>
+      <div class="discovery-note">${icon("info")}<span>扫描使用所选网卡及其 IPv4 网段。端口开放即可发现主机，完成 SSH 密码或私钥认证后才能纳管并采集。</span></div>
       <div class="toolbar">
         <strong style="font-size:11px;color:var(--text-soft)">发现结果</strong>
         <span class="last-update">${selectedCount} 个已选择</span>
@@ -1543,14 +1821,38 @@
 
   function modelThroughputChartDefinitions(data) {
     const inference = data.inference || {};
-    const minute = 60;
-    const currentMinute = Math.floor(Date.now() / 1000 / minute) * minute;
+    const configuredMinutes = Math.max(
+      1,
+      Number(
+        data.throughput_history?.window_minutes ||
+          settingValue("model_history_minutes", 30),
+      ),
+    );
+    const configuredBuckets = Math.max(
+      2,
+      Number(
+        data.throughput_history?.bucket_seconds
+          ? Math.round(
+              (configuredMinutes * 60) /
+                Number(data.throughput_history.bucket_seconds),
+            )
+          : settingValue("model_history_buckets", 30),
+      ),
+    );
+    const bucketSeconds = Math.max(
+      1,
+      Number(
+        data.throughput_history?.bucket_seconds ||
+          Math.round((configuredMinutes * 60) / configuredBuckets),
+      ),
+    );
+    const currentBucket = Math.floor(Date.now() / 1000 / bucketSeconds) * bucketSeconds;
     let points = Array.isArray(data.throughput_history?.points)
-      ? data.throughput_history.points.slice(-30)
+      ? data.throughput_history.points.slice(-configuredBuckets)
       : [];
     if (!points.length) {
-      points = Array.from({ length: 30 }, (_, index) => ({
-        ts: currentMinute - (29 - index) * minute,
+      points = Array.from({ length: configuredBuckets }, (_, index) => ({
+        ts: currentBucket - (configuredBuckets - 1 - index) * bucketSeconds,
         prefill_tokens_per_sec: null,
         decode_tokens_per_sec: null,
       }));
@@ -1588,7 +1890,7 @@
         points: points.map((point, index) => ({
           ts: point.ts,
           value: values[index],
-          label: formatMinuteClock(point.ts),
+          label: bucketSeconds >= 60 ? formatMinuteClock(point.ts) : formatClock(point.ts),
         })),
       };
     });
@@ -1821,7 +2123,7 @@
     state.modelLogsLoading = true;
     try {
       const payload = await api(
-        `/api/model/logs?rank=${encodeURIComponent(state.modelRank)}&lines=350`,
+        `/api/model/logs?rank=${encodeURIComponent(state.modelRank)}&lines=${encodeURIComponent(settingValue("ui_model_log_lines", 350))}`,
       );
       state.modelLogs = payload.lines || [];
       state.modelLogsUpdatedAt = Date.now();
@@ -1889,6 +2191,17 @@
     const kpis = modelKpiDefinitions(data);
     const throughputCharts = modelThroughputChartDefinitions(data);
     const nodes = data.model?.nodes || [];
+    const modelHistoryMinutes = Math.max(
+      1,
+      Number(data.throughput_history?.window_minutes || settingValue("model_history_minutes", 30)),
+    );
+    const modelHistoryBuckets = Math.max(
+      2,
+      Number(data.throughput_history?.bucket_seconds
+        ? Math.round((modelHistoryMinutes * 60) / Number(data.throughput_history.bucket_seconds))
+        : settingValue("model_history_buckets", 30)),
+    );
+    const modelPointInterval = (modelHistoryMinutes * 60) / modelHistoryBuckets;
     const statusClass = data.status === "degraded" ? "degraded" : data.status === "offline" ? "offline" : "";
     const rankOptions = [
       '<option value="all">全部节点</option>',
@@ -1948,7 +2261,7 @@
           </div>
         </section>
         <section class="model-panel">
-          <div class="model-panel-head"><h3>集群状态 <small>CLUSTER STATUS</small></h3><span>8 NODE</span></div>
+          <div class="model-panel-head"><h3>集群状态 <small>CLUSTER STATUS</small></h3><span>${nodes.length} NODE</span></div>
           <div class="model-compact-list">
             <div class="model-compact-row"><span>节点健康</span><strong data-model-field="health">${escapeHtml(fields.health)}</strong></div>
             <div class="model-compact-row"><span>服务状态</span><strong data-model-field="status">${escapeHtml(fields.status)}</strong></div>
@@ -1959,7 +2272,7 @@
           </div>
         </section>
         <section class="model-panel model-throughput-panel">
-          <div class="model-panel-head"><h3>30 分钟曲线 <small>P/D TIME SERIES</small></h3><span>1 MIN / POINT</span></div>
+          <div class="model-panel-head"><h3>${escapeHtml(formatHistoryRange(modelHistoryMinutes))}曲线 <small>P/D TIME SERIES</small></h3><span>${escapeHtml(formatPointInterval(modelPointInterval))}</span></div>
           <div class="model-throughput-bars">
             ${throughputCharts.map((item) => `
               <div class="model-throughput-item" data-model-throughput="${item.key}">
@@ -1969,7 +2282,7 @@
                 </div>
                 <div class="model-throughput-scale">峰值 ${escapeHtml(item.peak)} · ${escapeHtml(item.detail)}</div>
                 <div class="model-throughput-plot">
-                  <canvas data-throughput-canvas aria-label="${escapeHtml(item.label)} 最近 30 分钟吞吐曲线"></canvas>
+                  <canvas data-throughput-canvas aria-label="${escapeHtml(item.label)} 最近 ${escapeHtml(formatHistoryRange(modelHistoryMinutes))}吞吐曲线"></canvas>
                   <div class="model-throughput-tooltip" data-throughput-tooltip hidden></div>
                 </div>
                 <div class="model-throughput-axis">
@@ -2060,46 +2373,102 @@
     drawModelThroughputCharts();
   }
 
-  function renderSettings() {
-    const thresholds = state.dashboard?.thresholds || {};
-    const settings = state.settings || thresholds;
-    const summary = state.dashboard?.summary || {};
-    $("#content").innerHTML = `
-      ${pageHead("监控与告警参数", "修改后立即应用到下一次采样")}
-      <div class="settings-grid">
-        <section class="settings-card">
-          <div class="settings-card-head">
-            <h3>告警阈值</h3>
-            <p>持续超过阈值时进入活动告警。</p>
-          </div>
-          <form class="settings-body" id="settingsForm">
-            <div class="threshold-grid">
-              <label class="threshold-field"><span><b>CPU 使用率</b><b>%</b></span><input name="cpu_warning" type="number" min="1" max="100" value="${Number(settings.cpu_warning ?? 85)}"></label>
-              <label class="threshold-field"><span><b>内存使用率</b><b>%</b></span><input name="memory_warning" type="number" min="1" max="100" value="${Number(settings.memory_warning ?? 85)}"></label>
-              <label class="threshold-field"><span><b>GPU 负载</b><b>%</b></span><input name="gpu_warning" type="number" min="1" max="100" value="${Number(settings.gpu_warning ?? 90)}"></label>
-              <label class="threshold-field"><span><b>GPU 温度上限</b><b>°C</b></span><input name="temperature_warning" type="number" min="1" max="150" value="${Number(settings.temperature_warning ?? 80)}"></label>
-              <label class="threshold-field"><span><b>离线判定</b><b>秒</b></span><input name="offline_seconds" type="number" min="5" max="3600" value="${Number(settings.offline_seconds ?? 20)}"></label>
-            </div>
-            <div class="settings-actions"><button class="primary-button compact" type="submit">${icon("save")}<span>保存阈值</span></button></div>
-          </form>
-        </section>
-        <section class="settings-card">
-          <div class="settings-card-head">
-            <h3>控制面</h3>
-            <p>当前会话与本机运行状态。</p>
-          </div>
-          <div class="settings-body">
-            <div class="info-list">
-              <div class="info-row"><span>管理员</span><strong>${escapeHtml(state.user?.username || "admin")}</strong></div>
-              <div class="info-row"><span>在线节点</span><strong>${summary.online || 0} / ${summary.total || 0}</strong></div>
-              <div class="info-row"><span>采样间隔</span><strong>${state.dashboard?.poll_interval || 3} 秒</strong></div>
-              <div class="info-row"><span>会话有效期</span><strong>12 小时</strong></div>
-              <div class="info-row"><span>控制面版本</span><strong>Spark Grid 0.1.0</strong></div>
-            </div>
-            <div class="security-note">${icon("shield-check")}<span>会话 Cookie 使用 HttpOnly 与 SameSite=Strict；所有写操作同时校验 CSRF Token。</span></div>
-          </div>
-        </section>
+  function settingFieldHtml(field, rawValue) {
+    const value = rawValue ?? field.value ?? field.default;
+    const isBoolean = field.type === "bool";
+    const isNumeric = field.type === "int" || field.type === "float";
+    const isList = field.type === "list_int" || field.type === "list_str";
+    const isWide = isList || Number(field.max_length || 0) > 160;
+    const inputValue = isList
+      ? Array.isArray(value)
+        ? value.join(", ")
+        : String(value ?? "")
+      : isBoolean
+        ? value
+        : String(value ?? "");
+    const range =
+      field.min != null && field.max != null
+        ? `${formatNumber(field.min, field.type === "float" ? 2 : 0)} - ${formatNumber(field.max, field.type === "float" ? 2 : 0)}`
+        : "";
+    const meta = [field.unit, range].filter(Boolean).join(" · ");
+    const control = isBoolean
+      ? `
+        <label class="setting-toggle-control" for="setting-${escapeHtml(field.key)}">
+          <input id="setting-${escapeHtml(field.key)}" class="setting-checkbox" name="${escapeHtml(field.key)}" type="checkbox" ${value ? "checked" : ""}>
+          <span>${value ? "已启用" : "已关闭"}</span>
+        </label>
+      `
+      : `
+        <input
+          id="setting-${escapeHtml(field.key)}"
+          class="setting-input"
+          name="${escapeHtml(field.key)}"
+          type="${isNumeric ? "number" : "text"}"
+          value="${escapeHtml(inputValue)}"
+          ${isNumeric ? `min="${field.min ?? ""}" max="${field.max ?? ""}" step="${field.type === "float" ? "any" : "1"}" required` : ""}
+          ${field.max_length ? `maxlength="${Number(field.max_length)}"` : ""}
+          ${field.placeholder ? `placeholder="${escapeHtml(field.placeholder)}"` : ""}
+        >
+      `;
+    return `
+      <div class="setting-field ${isWide ? "is-wide" : ""} ${isBoolean ? "is-toggle" : ""}">
+        <span class="setting-label-row">
+          <strong>${escapeHtml(field.label)}</strong>
+          ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
+        </span>
+        <span class="setting-description">${escapeHtml(field.description)}</span>
+        ${control}
       </div>
+    `;
+  }
+
+  function renderSettings() {
+    const settings = state.settings || state.dashboard?.thresholds || {};
+    const summary = state.dashboard?.summary || {};
+    const process = state.settingsProcess || {};
+    const groups = state.settingsGroups.filter((group) => group.fields?.length);
+    const groupHtml = groups.map((group) => `
+      <section class="settings-group" data-settings-group="${escapeHtml(group.key)}">
+        <div class="settings-card-head">
+          <h3>${escapeHtml(group.label)}</h3>
+          <p>${escapeHtml(group.description)}</p>
+        </div>
+        <div class="settings-fields">
+          ${group.fields.map((field) => settingFieldHtml(field, settings[field.key])).join("")}
+        </div>
+      </section>
+    `).join("");
+    $("#content").innerHTML = `
+      ${pageHead(
+        "系统设置",
+        "所有运行参数均由当前页面管理，保存后自动应用到后续采集和刷新。",
+        `<button class="button secondary compact" type="submit" form="settingsForm">${icon("save")}<span>保存设置</span></button>`,
+      )}
+      <form id="settingsForm" class="settings-layout">
+        <div class="settings-groups">${groupHtml}</div>
+        <aside class="settings-side">
+          <section class="settings-card">
+            <div class="settings-card-head">
+              <h3>控制面</h3>
+              <p>当前会话与本机运行状态。</p>
+            </div>
+            <div class="settings-body">
+              <div class="info-list">
+                <div class="info-row"><span>管理员</span><strong>${escapeHtml(state.user?.username || "admin")}</strong></div>
+                <div class="info-row"><span>在线节点</span><strong>${summary.online || 0} / ${summary.total || 0}</strong></div>
+                <div class="info-row"><span>采集间隔</span><strong>${escapeHtml(formatNumber(settingValue("poll_interval", 3), 1))} 秒</strong></div>
+                <div class="info-row"><span>会话有效期</span><strong>${escapeHtml(formatNumber(settingValue("session_ttl_hours", 12)))} 小时</strong></div>
+                <div class="info-row"><span>控制面版本</span><strong>${escapeHtml(state.version || "—")}</strong></div>
+                <div class="info-row"><span>监听地址</span><strong class="path-value">${escapeHtml(`${process.host || "—"}:${process.port || "—"}`)}</strong></div>
+                <div class="info-row"><span>数据目录</span><strong class="path-value">${escapeHtml(process.data_dir || "—")}</strong></div>
+                <div class="info-row"><span>数据库文件</span><strong class="path-value">${escapeHtml(process.database_path || "—")}</strong></div>
+              </div>
+              <div class="security-note">${icon("shield-check")}<span>会话 Cookie 使用 HttpOnly 与 SameSite=Strict；所有写操作同时校验 CSRF Token；SSH 密码以加密形式保存。</span></div>
+              <div class="settings-actions"><button class="primary-button compact" type="submit">${icon("save")}<span>保存设置</span></button></div>
+            </div>
+          </section>
+        </aside>
+      </form>
     `;
   }
 
@@ -2111,7 +2480,10 @@
     const id = Number(nodeId);
     if (state.historyNodeId !== id) {
       state.historyNodeId = id;
-      state.historyRange = 30;
+      const configuredDefault = Number(settingValue("ui_history_minutes", 30));
+      state.historyRange = configuredHistoryRanges().includes(configuredDefault)
+        ? configuredDefault
+        : configuredHistoryRanges()[0];
       state.historyData = null;
     }
     state.drawerNodeId = id;
@@ -2258,13 +2630,10 @@
       state.historyNodeId === Number(node.id) && Array.isArray(state.historyData)
         ? state.historyData
         : [];
-    const rangeOptions = [
-      [5, "5 分钟"],
-      [30, "30 分钟"],
-      [60, "1 小时"],
-      [360, "6 小时"],
-      [1440, "24 小时"],
-    ];
+    const rangeOptions = configuredHistoryRanges().map((minutes) => [
+      minutes,
+      formatHistoryRange(minutes),
+    ]);
     const historyStatus = state.historyLoading
       ? "正在加载"
       : history.length
@@ -2277,7 +2646,7 @@
         <div class="drawer-head">
           <div class="drawer-title">
             <span class="node-status ${node.status}" data-drawer-status></span>
-            <div><strong>${escapeHtml(node.name)}</strong><span data-drawer-subtitle>${escapeHtml(node.ssh_user || "spark")}@${escapeHtml(node.host)}:${node.ssh_port || 22} · ${statusLabel(node.status)}</span></div>
+            <div><strong>${escapeHtml(node.name)}</strong><span data-drawer-subtitle>${escapeHtml(sshAddress(node.ssh_user, node.host, node.ssh_port))} · ${statusLabel(node.status)}</span></div>
           </div>
           <div class="drawer-actions">
             <button class="icon-button subtle" data-action="refresh-node" data-id="${node.id}" title="刷新" aria-label="刷新">${icon("refresh-cw")}</button>
@@ -2287,7 +2656,7 @@
         </div>
         <div class="drawer-body">
           <div class="drawer-hero">
-            <div class="drawer-stat"><span>GPU LOAD · POWER EST.</span><strong><span data-drawer-stat="gpu">${formatNumber(gpu, 1)}</span><small>%</small></strong></div>
+            <div class="drawer-stat"><span>${escapeHtml(gpuLoadLabel(firstGpu))}</span><strong><span data-drawer-stat="gpu">${formatNumber(gpu, 1)}</span><small>%</small></strong></div>
             <div class="drawer-stat"><span>UNIFIED MEMORY</span><strong><span data-drawer-stat="memory">${formatNumber(resources.memory_percent, 1)}</span><small>%</small></strong></div>
             <div class="drawer-stat"><span>CPU UTILIZATION</span><strong><span data-drawer-stat="cpu">${formatNumber(resources.cpu_percent, 1)}</span><small>%</small></strong></div>
             <div class="drawer-stat"><span>GPU TEMPERATURE</span><strong><span data-drawer-stat="temperature">${formatNumber(resources.temperature_max, 0)}</span><small>°C</small></strong></div>
@@ -2309,7 +2678,7 @@
             </div>
           </div>
           <div class="detail-grid">
-            <div class="detail-grid-item"><span>GPU</span><strong data-drawer-detail="gpu-name">${escapeHtml(firstGpu.name || "NVIDIA GB10")}</strong></div>
+            <div class="detail-grid-item"><span>GPU</span><strong data-drawer-detail="gpu-name">${escapeHtml(firstGpu.name || gpuFallbackName())}</strong></div>
             <div class="detail-grid-item"><span>GPU 负载口径</span><strong data-drawer-detail="gpu-source">${firstGpu.load_source === "power estimate" ? "功耗 + P-State 估算" : "驱动利用率"}</strong></div>
             <div class="detail-grid-item"><span>GPU 功耗</span><strong data-drawer-detail="gpu-power">${firstGpu.power != null ? `${formatNumber(firstGpu.power, 0)} W` : "—"}</strong></div>
             <div class="detail-grid-item"><span>GPU 温度</span><strong data-drawer-detail="gpu-temp">${firstGpu.temperature != null ? `${formatNumber(firstGpu.temperature, 0)}°C` : "—"}</strong></div>
@@ -2324,9 +2693,9 @@
             <div class="detail-grid-item"><span>运行时间</span><strong data-drawer-detail="uptime">${formatDuration(resources.uptime)}</strong></div>
             <div class="detail-grid-item"><span>进程数</span><strong data-drawer-detail="processes">${formatNumber(resources.process_count)}</strong></div>
             <div class="detail-grid-item"><span>采集延迟</span><strong data-drawer-detail="latency">${formatNumber(node.last_latency_ms, 0)} ms</strong></div>
-            <div class="detail-grid-item"><span>分组 / 标签</span><strong data-drawer-detail="identity">${escapeHtml(node.group_name || "未分组")} · ${escapeHtml((node.tags || []).join(" / ") || "—")}</strong></div>
-            <div class="detail-grid-item"><span>最后心跳</span><strong data-drawer-detail="heartbeat">${formatDateTime(node.last_seen)}</strong></div>
-            <div class="detail-grid-item"><span>SSH 连接</span><strong data-drawer-detail="ssh">${escapeHtml(node.ssh_user || "spark")}@${escapeHtml(node.host)}:${node.ssh_port || 22}</strong></div>
+            <div class="detail-grid-item"><span>分组 / 标签</span><strong data-drawer-detail="identity">${escapeHtml(node.group_name || defaultGroupName())} · ${escapeHtml((node.tags || []).join(" / ") || "—")}</strong></div>
+            <div class="detail-grid-item"><span>最近采集</span><strong data-drawer-detail="heartbeat">${formatDateTime(node.last_seen)}</strong></div>
+            <div class="detail-grid-item"><span>SSH 连接</span><strong data-drawer-detail="ssh">${escapeHtml(sshAddress(node.ssh_user, node.host, node.ssh_port))}</strong></div>
           </div>
           <section class="detail-network" data-drawer-network>
             ${drawerNetworkHtml(network)}
@@ -2353,7 +2722,7 @@
     if (statusDot) statusDot.className = `node-status ${node.status}`;
     const subtitle = $("[data-drawer-subtitle]", root);
     if (subtitle) {
-      subtitle.textContent = `${node.ssh_user || "spark"}@${node.host}:${node.ssh_port || 22} · ${statusLabel(node.status)}`;
+      subtitle.textContent = `${sshAddress(node.ssh_user, node.host, node.ssh_port)} · ${statusLabel(node.status)}`;
     }
     const title = $(".drawer-title strong", root);
     if (title) title.textContent = node.name;
@@ -2367,7 +2736,7 @@
       const element = $(`[data-drawer-stat="${key}"]`, root);
       if (element && element.textContent !== value) element.textContent = value;
     }
-    setDetail("gpu-name", firstGpu.name || "NVIDIA GB10");
+    setDetail("gpu-name", firstGpu.name || gpuFallbackName());
     setDetail(
       "gpu-source",
       firstGpu.load_source === "power estimate" ? "功耗 + P-State 估算" : "驱动利用率",
@@ -2400,9 +2769,9 @@
     setDetail("uptime", formatDuration(resources.uptime));
     setDetail("processes", formatNumber(resources.process_count));
     setDetail("latency", `${formatNumber(node.last_latency_ms, 0)} ms`);
-    setDetail("identity", `${node.group_name || "未分组"} · ${(node.tags || []).join(" / ") || "—"}`);
+    setDetail("identity", `${node.group_name || defaultGroupName()} · ${(node.tags || []).join(" / ") || "—"}`);
     setDetail("heartbeat", formatDateTime(node.last_seen));
-    setDetail("ssh", `${node.ssh_user || "spark"}@${node.host}:${node.ssh_port || 22}`);
+    setDetail("ssh", sshAddress(node.ssh_user, node.host, node.ssh_port));
     const network = $("[data-drawer-network]", root);
     patchDrawerNetwork(network, drawerNetwork(node));
   }
@@ -2463,11 +2832,11 @@
           <div class="modal-body">
             <div class="form-grid">
               <label class="field full"><span>节点地址</span><textarea class="textarea" name="input" required placeholder="192.0.2.11&#10;192.0.2.12,spark2,G1&#10;192.0.2.13-18"></textarea><span class="field-hint">每行支持 IP、主机名、CIDR 或尾段范围；可附带名称、分组和标签。</span></label>
-              <label class="field"><span>默认分组</span><input class="text-input" name="group_name" value="Spark 集群"></label>
+              <label class="field"><span>默认分组</span><input class="text-input" name="group_name" value="${escapeHtml(defaultGroupName())}"></label>
               <label class="field"><span>默认标签</span><input class="text-input" name="tags" placeholder="spark, lan"></label>
-              <label class="field"><span>SSH 用户</span><input class="text-input" name="ssh_user" value="spark" required></label>
-              <label class="field"><span>SSH 端口</span><input class="text-input" name="ssh_port" type="number" min="1" max="65535" value="22"></label>
-              <label class="field full"><span>私钥路径</span><input class="text-input" name="ssh_key_path" placeholder="留空使用中心端 SSH 配置"></label>
+              ${sshCredentialFields({
+                passwordHint: "密码会加密保存；也可以只填写私钥路径。",
+              })}
             </div>
             <div id="modalError" class="form-error modal-error" hidden></div>
           </div>
@@ -2481,22 +2850,32 @@
     const node = findNode(nodeId);
     if (!node) return;
     openModal(`
-      <div class="modal">
+      <div class="modal wide">
         <div class="modal-head"><h3>编辑节点</h3><button class="icon-button subtle" data-action="close-modal" title="关闭" aria-label="关闭">${icon("x")}</button></div>
         <form id="editNodeForm" data-id="${node.id}">
           <div class="modal-body">
             <div class="form-grid">
               <label class="field"><span>节点名称</span><input class="text-input" name="name" value="${escapeHtml(node.name)}" required></label>
               <label class="field"><span>节点地址</span><input class="text-input" name="host" value="${escapeHtml(node.host)}" required></label>
-              <label class="field"><span>分组</span><input class="text-input" name="group_name" value="${escapeHtml(node.group_name || "未分组")}"></label>
+              <label class="field"><span>分组</span><input class="text-input" name="group_name" value="${escapeHtml(node.group_name || defaultGroupName())}"></label>
               <label class="field"><span>标签</span><input class="text-input" name="tags" value="${escapeHtml((node.tags || []).join(", "))}"></label>
-              <label class="field"><span>SSH 用户</span><input class="text-input" name="ssh_user" value="${escapeHtml(node.ssh_user || "spark")}" required></label>
-              <label class="field"><span>SSH 端口</span><input class="text-input" name="ssh_port" type="number" min="1" max="65535" value="${node.ssh_port || 22}"></label>
-              <label class="field full"><span>私钥路径</span><input class="text-input" name="ssh_key_path" value="${escapeHtml(node.ssh_key_path || "")}" placeholder="留空使用中心端 SSH 配置"></label>
+              ${sshCredentialFields({
+                user: node.ssh_user,
+                port: node.ssh_port,
+                keyPath: node.ssh_key_path,
+                passwordConfigured: Boolean(node.ssh_password_configured),
+                allowClearPassword: true,
+                passwordHint: "留空保持已保存密码；填写新密码会替换旧密码。",
+              })}
             </div>
             <div id="modalError" class="form-error modal-error" hidden></div>
           </div>
-          <div class="modal-foot"><button class="button secondary" type="button" data-action="close-modal">取消</button><button class="primary-button" type="submit">${icon("save")}<span>保存修改</span></button></div>
+          <div class="modal-foot">
+            <button class="button ghost" type="button" data-action="test-node" data-id="${node.id}">${icon("plug-zap")}<span>测试已保存连接</span></button>
+            <span class="toolbar-spacer"></span>
+            <button class="button secondary" type="button" data-action="close-modal">取消</button>
+            <button class="primary-button" type="submit">${icon("save")}<span>保存修改</span></button>
+          </div>
         </form>
       </div>
     `);
@@ -2517,13 +2896,32 @@
     `);
   }
 
-  function openScanModal() {
+  async function openScanModal() {
+    if (!state.discovery) await loadDiscovery(true);
+    const interfaces = state.discovery?.interfaces || [];
+    if (state.scanInterface && !interfaces.some((item) => item.name === state.scanInterface)) {
+      state.scanInterface = "";
+    }
+    const options = [
+      `<option value="" ${state.scanInterface ? "" : "selected"}>${interfaces.length ? "自动选择全部可用网卡" : "未检测到 IPv4 网卡"}</option>`,
+      ...interfaces.map((item) => `
+        <option value="${escapeHtml(item.name)}" ${state.scanInterface === item.name ? "selected" : ""}>
+          ${escapeHtml(item.name)} · ${escapeHtml(item.address)} · ${escapeHtml(item.cidr)}${item.physical ? "" : " · 虚拟"}
+        </option>
+      `),
+    ].join("");
     openModal(`
-      <div class="modal">
+      <div class="modal wide">
         <div class="modal-head"><h3>扫描局域网</h3><button class="icon-button subtle" data-action="close-modal" title="关闭" aria-label="关闭">${icon("x")}</button></div>
         <form id="scanModalForm">
           <div class="modal-body">
-            <label class="field"><span>CIDR 范围</span><input class="text-input" name="cidrs" placeholder="留空使用本机全部业务网段"></label>
+            <div class="form-grid">
+              <label class="field full"><span>扫描网卡</span><select class="select" name="interface">${options}</select><span class="field-hint">扫描范围会按所选网卡的 IPv4 网段自动生成。</span></label>
+              <label class="field full"><span>CIDR 覆盖</span><input class="text-input" name="cidrs" placeholder="留空使用所选网卡网段"></label>
+              ${sshCredentialFields({
+                passwordHint: "密码只用于本次扫描和认证成功后的加密保存；留空时优先复用已保存凭据。",
+              })}
+            </div>
           </div>
           <div class="modal-foot"><button class="button secondary" type="button" data-action="close-modal">取消</button><button class="primary-button" type="submit">${icon("scan-line")}<span>开始扫描</span></button></div>
         </form>
@@ -2531,19 +2929,58 @@
     `);
   }
 
-  async function startScan(cidrs = "") {
+  function readSshCredentials(data) {
+    const credentials = {
+      ssh_user: String(data.get("ssh_user") || "").trim(),
+      ssh_key_path: String(data.get("ssh_key_path") || "").trim(),
+    };
+    const portValue = String(data.get("ssh_port") || "").trim();
+    if (portValue) credentials.ssh_port = Number(portValue);
+    const password = String(data.get("ssh_password") || "");
+    if (password) credentials.ssh_password = password;
+    return credentials;
+  }
+
+  async function startScan(interfaceName = "", cidrs = "", credentials = {}) {
     try {
       const list = cidrs
         .split(/[,;\s]+/)
         .map((item) => item.trim())
         .filter(Boolean);
-      await api("/api/discovery/scan", { method: "POST", body: { cidrs: list } });
+      const payload = await api("/api/discovery/scan", {
+        method: "POST",
+        body: { interface: interfaceName || null, cidrs: list, ...credentials },
+      });
+      state.scanInterface = interfaceName || "";
+      state.discovery = {
+        ...(state.discovery || { discovered: [], interfaces: [] }),
+        scan: payload.scan,
+      };
       closeModal();
       showToast("局域网扫描已启动");
       navigate("discovery");
       window.setTimeout(() => loadDiscovery(), 900);
     } catch (error) {
       showToast(error.message, "error");
+    }
+  }
+
+  async function testNodeConnection(nodeId, button) {
+    setButtonBusy(button, true, "测试中");
+    try {
+      const result = await api(`/api/nodes/${nodeId}/test`, {
+        method: "POST",
+        body: {},
+      });
+      const latency = Number(result.latency_ms);
+      const target = String(result.hostname || result.host || "").trim();
+      showToast(
+        `SSH 连接成功${target ? `：${target}` : ""}${Number.isFinite(latency) ? `，${Math.round(latency)} ms` : ""}`,
+      );
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      setButtonBusy(button, false);
     }
   }
 
@@ -2650,7 +3087,7 @@
         } else if (action === "open-bulk-add") {
           openBulkAddModal();
         } else if (action === "scan-network" || action === "scan-network-inline") {
-          openScanModal();
+          await openScanModal();
         } else if (action === "refresh-discovery") {
           await loadDiscovery();
         } else if (action === "import-selected") {
@@ -2665,6 +3102,11 @@
           closeDrawer();
         } else if (action === "refresh-node") {
           await refreshNode(Number(actionElement.dataset.id));
+        } else if (action === "test-node") {
+          await testNodeConnection(
+            Number(actionElement.dataset.id),
+            actionElement,
+          );
         } else if (action === "edit-node") {
           openEditNodeModal(Number(actionElement.dataset.id));
         } else if (action === "delete-node") {
@@ -2743,6 +3185,8 @@
         state.modelRank = target.value;
         state.modelLogs = [];
         loadModelLogs();
+      } else if (target.id === "scanInterface") {
+        state.scanInterface = target.value;
       }
     });
 
@@ -2775,9 +3219,21 @@
       if (form.id === "authForm") await submitAuth(form);
       else if (form.id === "bulkAddForm") await submitBulkAdd(form);
       else if (form.id === "editNodeForm") await submitEditNode(form);
-      else if (form.id === "scanForm") await startScan(new FormData(form).get("scanCidrs") || "");
-      else if (form.id === "scanModalForm") await startScan(new FormData(form).get("cidrs") || "");
-      else if (form.id === "batchTextForm") {
+      else if (form.id === "scanForm") {
+        const data = new FormData(form);
+        await startScan(
+          String(data.get("interface") || ""),
+          String(data.get("scanCidrs") || ""),
+          readSshCredentials(data),
+        );
+      } else if (form.id === "scanModalForm") {
+        const data = new FormData(form);
+        await startScan(
+          String(data.get("interface") || ""),
+          String(data.get("cidrs") || ""),
+          readSshCredentials(data),
+        );
+      } else if (form.id === "batchTextForm") {
         const kind = form.dataset.kind;
         const raw = new FormData(form).get("value") || "";
         const extra = kind === "group" ? { group_name: raw } : { tags: raw };
@@ -2827,7 +3283,7 @@
       state.csrf = payload.csrf_token;
       form.reset();
       showApp();
-      await loadDashboard();
+      await Promise.all([loadSettings(true), loadDashboard()]);
       startPolling();
     } catch (error) {
       errorBox.textContent = error.message;
@@ -2869,9 +3325,7 @@
           input: data.get("input"),
           group_name: data.get("group_name"),
           tags: data.get("tags"),
-          ssh_port: Number(data.get("ssh_port")),
-          ssh_user: data.get("ssh_user"),
-          ssh_key_path: data.get("ssh_key_path"),
+          ...readSshCredentials(data),
         },
       });
       closeModal();
@@ -2891,6 +3345,13 @@
     const button = $("button[type=submit]", form);
     const errorBox = $("#modalError");
     const data = new FormData(form);
+    const password = String(data.get("ssh_password") || "");
+    const clearPassword = Boolean(data.get("clear_ssh_password"));
+    if (password && clearPassword) {
+      errorBox.textContent = "不能同时设置新密码和清除已保存密码";
+      errorBox.hidden = false;
+      return;
+    }
     setButtonBusy(button, true, "保存中");
     errorBox.hidden = true;
     try {
@@ -2901,9 +3362,11 @@
           host: data.get("host"),
           group_name: data.get("group_name"),
           tags: data.get("tags"),
-          ssh_port: Number(data.get("ssh_port")),
+          ssh_port: data.get("ssh_port") ? Number(data.get("ssh_port")) : null,
           ssh_user: data.get("ssh_user"),
           ssh_key_path: data.get("ssh_key_path"),
+          ssh_password: password,
+          clear_ssh_password: clearPassword,
         },
       });
       closeModal();
@@ -2918,19 +3381,36 @@
   }
 
   async function saveSettings(form) {
-    const button = $("button[type=submit]", form);
-    const data = Object.fromEntries(new FormData(form).entries());
+    const button = $("button[type='submit'][form='settingsForm']");
+    const data = {};
+    for (const field of state.settingsFields) {
+      const input = form.elements.namedItem(field.key);
+      if (!input) continue;
+      if (field.type === "bool") {
+        data[field.key] = input.checked ? 1 : 0;
+      } else if (field.type === "int" || field.type === "float") {
+        data[field.key] = Number(input.value);
+      } else {
+        data[field.key] = String(input.value ?? "");
+      }
+    }
+    if (!form.reportValidity()) return;
     setButtonBusy(button, true, "保存中");
     try {
       const result = await api("/api/settings", { method: "PATCH", body: data });
-      state.settings = result.settings;
-      if (state.dashboard) state.dashboard.thresholds = result.settings;
-      showToast("监控阈值已保存");
-      renderSettings();
-      refreshIcons($("#content"));
+      applySettingsPayload(result);
+      state.clusterHistory = null;
+      state.clusterHistoryLoadedAt = 0;
+      await Promise.all([
+        loadClusterHistory(state.historyRange),
+        loadDashboard(true),
+      ]);
+      startPolling();
+      setButtonBusy(button, false);
+      renderCurrentView();
+      showToast("系统设置已保存");
     } catch (error) {
       showToast(error.message, "error");
-    } finally {
       setButtonBusy(button, false);
     }
   }
@@ -2941,7 +3421,7 @@
     try {
       const result = await api("/api/discovery/import", {
         method: "POST",
-        body: { hosts, group_name: "自动发现" },
+        body: { hosts },
       });
       state.selectedDiscovery.clear();
       showToast(`已纳管 ${result.added} 个节点`);

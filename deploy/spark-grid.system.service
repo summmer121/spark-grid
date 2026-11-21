@@ -5,18 +5,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=spark
-Group=spark
-Environment=HOME=/home/spark
-WorkingDirectory=/home/spark/spark-monitor
-EnvironmentFile=-/home/spark/spark-monitor/.env
-ExecStart=/usr/bin/python3 -m app.main
+User=@SPARK_SERVICE_USER@
+Group=@SPARK_SERVICE_GROUP@
+Environment=HOME="@SPARK_SERVICE_HOME@"
+WorkingDirectory="@SPARK_ROOT@"
+EnvironmentFile=-"@SPARK_ENV_FILE@"
+ExecStart="@SPARK_PYTHON@" -m app.main
 Restart=always
 RestartSec=3
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
-ReadWritePaths=/home/spark/spark-monitor/data
+ReadWritePaths=@SPARK_READ_WRITE_PATHS@
 
 [Install]
 WantedBy=multi-user.target
