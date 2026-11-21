@@ -1,0 +1,14 @@
+[Unit]
+Description=Spark Grid SSH tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/spark-grid/tunnel.env
+ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -i ${SPARK_TUNNEL_KEY} -p ${SPARK_TUNNEL_PORT} -L 127.0.0.1:16301:${SPARK_TUNNEL_TARGET_HOST}:${SPARK_TUNNEL_TARGET_PORT} ${SPARK_TUNNEL_USER}@${SPARK_TUNNEL_HOST}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

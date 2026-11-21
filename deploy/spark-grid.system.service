@@ -1,0 +1,22 @@
+[Unit]
+Description=Spark Grid monitoring center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spark
+Group=spark
+Environment=HOME=/home/spark
+WorkingDirectory=/home/spark/spark-monitor
+EnvironmentFile=-/home/spark/spark-monitor/.env
+ExecStart=/usr/bin/python3 -m app.main
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/home/spark/spark-monitor/data
+
+[Install]
+WantedBy=multi-user.target

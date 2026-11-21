@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
+.server.pid
+.server.log
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.pytest_cache/
+.DS_Store

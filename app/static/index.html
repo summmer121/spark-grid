@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0e0f">
+  <title>Spark Grid</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/css/app.css?v=20261120-13">
+</head>
+<body>
+  <div id="bootScreen" class="boot-screen">
+    <div class="brand-mark large" aria-hidden="true">
+      <span></span><span></span><span></span><span></span>
+    </div>
+    <div class="boot-copy">
+      <strong>SPARK GRID</strong>
+      <span>正在连接集群控制面</span>
+    </div>
+    <div class="boot-line"><i></i></div>
+  </div>
+
+  <section id="authScreen" class="auth-screen" hidden>
+    <div class="auth-visual" aria-hidden="true">
+      <div class="auth-visual-grid"></div>
+      <div class="cluster-orbit orbit-one"></div>
+      <div class="cluster-orbit orbit-two"></div>
+      <div class="cluster-core">
+        <span class="core-node node-a"></span>
+        <span class="core-node node-b"></span>
+        <span class="core-node node-c"></span>
+        <span class="core-node node-d"></span>
+        <span class="core-node node-e"></span>
+        <span class="core-node node-f"></span>
+        <span class="core-node node-g"></span>
+        <span class="core-node node-h"></span>
+        <div class="core-center">
+          <div class="brand-mark"><span></span><span></span><span></span><span></span></div>
+        </div>
+      </div>
+      <div class="auth-visual-meta">
+        <span>CONTROL PLANE</span>
+        <span>8 NODE FABRIC</span>
+      </div>
+    </div>
+    <div class="auth-panel">
+      <div class="auth-panel-inner">
+        <div class="mobile-brand">
+          <div class="brand-mark"><span></span><span></span><span></span><span></span></div>
+          <span>SPARK GRID</span>
+        </div>
+        <div class="auth-kicker" id="authKicker">集群控制台</div>
+        <h1 id="authTitle">登录 Spark Grid</h1>
+        <p class="auth-subtitle" id="authSubtitle">使用管理员凭据进入监控中心。</p>
+        <form id="authForm" novalidate>
+          <label class="field">
+            <span>用户名</span>
+            <div class="input-shell">
+              <i data-lucide="user-round"></i>
+              <input id="authUsername" name="username" autocomplete="username" value="admin" required>
+            </div>
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <div class="input-shell">
+              <i data-lucide="key-round"></i>
+              <input id="authPassword" name="password" type="password" autocomplete="current-password" required>
+              <button class="icon-button subtle password-toggle" type="button" data-action="toggle-password" title="显示密码" aria-label="显示密码">
+                <i data-lucide="eye"></i>
+              </button>
+            </div>
+          </label>
+          <label class="field setup-only" hidden>
+            <span>确认密码</span>
+            <div class="input-shell">
+              <i data-lucide="shield-check"></i>
+              <input id="authPasswordConfirm" name="password_confirm" type="password" autocomplete="new-password">
+            </div>
+          </label>
+          <div id="authError" class="form-error" role="alert" hidden></div>
+          <button class="primary-button auth-submit" type="submit">
+            <span id="authSubmitText">进入控制台</span>
+            <i data-lucide="arrow-right"></i>
+          </button>
+        </form>
+        <div class="auth-foot">
+          <span class="status-dot neutral"></span>
+          <span>管理员会话受保护</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="appShell" class="app-shell" hidden>
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-mark"><span></span><span></span><span></span><span></span></div>
+        <div>
+          <strong>SPARK GRID</strong>
+          <span>集群监控中心</span>
+        </div>
+      </div>
+      <nav class="main-nav" aria-label="主导航">
+        <button class="nav-button active" data-view="overview">
+          <i data-lucide="layout-dashboard"></i><span>总览</span>
+        </button>
+        <button class="nav-button" data-view="nodes">
+          <i data-lucide="server"></i><span>节点管理</span>
+        </button>
+        <button class="nav-button" data-view="discovery">
+          <i data-lucide="radar"></i><span>局域网发现</span>
+        </button>
+        <button class="nav-button" data-view="alerts">
+          <i data-lucide="bell-ring"></i><span>告警中心</span>
+          <span class="nav-count" id="alertNavCount" hidden>0</span>
+        </button>
+        <button class="nav-button" data-view="audit">
+          <i data-lucide="scroll-text"></i><span>操作审计</span>
+        </button>
+      </nav>
+      <div class="sidebar-section">
+        <span class="sidebar-label">系统</span>
+        <button class="nav-button" data-view="settings">
+          <i data-lucide="sliders-horizontal"></i><span>监控设置</span>
+        </button>
+      </div>
+      <div class="sidebar-cluster">
+        <div class="cluster-mini">
+          <span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span>
+        </div>
+        <div>
+          <strong id="sideOnline">0 / 0</strong>
+          <span>节点在线</span>
+        </div>
+      </div>
+      <div class="sidebar-user">
+        <div class="user-avatar" id="userInitial">A</div>
+        <div>
+          <strong id="userName">admin</strong>
+          <span>管理员</span>
+        </div>
+        <button class="icon-button subtle" data-action="logout" title="退出登录" aria-label="退出登录">
+          <i data-lucide="log-out"></i>
+        </button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="topbar-nav">
+          <button class="icon-button mobile-menu" data-action="toggle-menu" title="菜单" aria-label="菜单">
+            <i data-lucide="menu"></i>
+          </button>
+          <div class="runtime-tabs" aria-label="运行时视图">
+            <button class="runtime-tab active" data-view="overview">
+              <i data-lucide="layout-dashboard"></i>
+              <span>集群总览</span>
+            </button>
+            <button class="runtime-tab" data-view="model">
+              <i data-lucide="brain-circuit"></i>
+              <span>模型管理</span>
+            </button>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div class="live-indicator"><span></span> LIVE</div>
+          <span class="last-update" id="lastUpdate">正在同步</span>
+          <button class="icon-button" data-action="refresh-all" title="立即刷新" aria-label="立即刷新">
+            <i data-lucide="refresh-cw"></i>
+          </button>
+          <button class="button secondary compact" data-action="open-bulk-add">
+            <i data-lucide="plus"></i><span>添加节点</span>
+          </button>
+        </div>
+      </header>
+      <div id="content" class="content"></div>
+    </main>
+  </div>
+
+  <div id="drawerRoot"></div>
+  <div id="modalRoot"></div>
+  <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+
+  <script src="/vendor/lucide.min.js"></script>
+  <script src="/js/app.js?v=20261120-13"></script>
+</body>
+</html>

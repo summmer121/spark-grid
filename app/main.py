@@ -1,0 +1,1197 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import hmac
+import io
+import ipaddress
+import json
+import logging
+import mimetypes
+import os
+import re
+import sqlite3
+import threading
+import time
+import urllib.parse
+from http import HTTPStatus
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+from . import __version__
+from .auth import (
+    LoginThrottle,
+    create_session,
+    hash_password,
+    token_hash,
+    verify_password,
+)
+from .collector import MetricsCollector
+from .config import Settings, load_settings
+from .db import Database
+from .discovery import DiscoveryService
+from .model_monitor import ModelMonitor
+
+
+LOGGER = logging.getLogger("spark-grid")
+SESSION_COOKIE = "spark_grid_session"
+DEFAULT_THRESHOLDS: dict[str, Any] = {
+    "cpu_warning": 85,
+    "memory_warning": 85,
+    "gpu_warning": 90,
+    "temperature_warning": 80,
+    "offline_seconds": 20,
+}
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _safe_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _tags(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw = value
+    else:
+        raw = re.split(r"[,;|]", str(value or ""))
+    return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))[:20]
+
+
+def _default_name(host: str) -> str:
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host):
+        return f"spark-{host.rsplit('.', 1)[-1]}"
+    return host.split(".", 1)[0]
+
+
+def _expand_host_token(token: str, limit: int) -> list[str]:
+    token = token.strip()
+    if not token:
+        return []
+    if "/" in token:
+        try:
+            network = ipaddress.ip_network(token, strict=False)
+            hosts = [str(address) for address in network.hosts()]
+            if network.num_addresses == 1:
+                hosts = [str(network.network_address)]
+            return hosts[:limit]
+        except ValueError:
+            return []
+    match = re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3})\.\.(\d{1,3})", token)
+    if not match:
+        match = re.fullmatch(r"(\d{1,3}(?:\.\d{1,3}){3})-(\d{1,3})", token)
+    if match:
+        prefix, end_text = match.groups()
+        base = prefix.rsplit(".", 1)[0]
+        try:
+            start = int(prefix.rsplit(".", 1)[-1])
+            end = int(end_text)
+            if end < start:
+                return []
+            return [f"{base}.{last}" for last in range(start, min(255, end) + 1)][:limit]
+        except ValueError:
+            return []
+    match = re.fullmatch(
+        r"(\d{1,3}(?:\.\d{1,3}){3})-(\d{1,3}(?:\.\d{1,3}){3})", token
+    )
+    if match:
+        try:
+            start_ip = ipaddress.ip_address(match.group(1))
+            end_ip = ipaddress.ip_address(match.group(2))
+            if start_ip.version != 4 or end_ip.version != 4 or int(end_ip) < int(start_ip):
+                return []
+            return [
+                str(ipaddress.ip_address(value))
+                for value in range(int(start_ip), min(int(end_ip) + 1, int(start_ip) + limit))
+            ]
+        except ValueError:
+            return []
+    return [token]
+
+
+def _parse_bulk_lines(
+    text: str,
+    default_group: str,
+    default_tags: list[str],
+    ssh_port: int,
+    ssh_user: str,
+    ssh_key_path: str,
+    limit: int = 256,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    parsed: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            columns = next(csv.reader([line]))
+        except csv.Error:
+            columns = [line]
+        host_token = columns[0].strip()
+        if not host_token:
+            continue
+        for host in _expand_host_token(host_token, max(1, limit - len(parsed))):
+            if not HOST_RE.fullmatch(host):
+                errors.append(f"第 {line_number} 行：地址格式无效")
+                break
+            if host in seen:
+                continue
+            seen.add(host)
+            parsed.append(
+                {
+                    "host": host,
+                    "name": columns[1].strip() if len(columns) > 1 and columns[1].strip() else _default_name(host),
+                    "group_name": columns[2].strip() if len(columns) > 2 and columns[2].strip() else default_group,
+                    "tags": _tags(columns[3]) if len(columns) > 3 and columns[3].strip() else default_tags,
+                    "ssh_port": ssh_port,
+                    "ssh_user": ssh_user,
+                    "ssh_key_path": ssh_key_path,
+                }
+            )
+            if len(parsed) >= limit:
+                errors.append(f"单次最多处理 {limit} 个地址")
+                return parsed, errors
+    return parsed, errors
+
+
+class SparkGridApp:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.db = Database(settings.data_dir / "spark-grid.db")
+        self.throttle = LoginThrottle()
+        self.started_at = _now()
+        self.collector = MetricsCollector(self.db, settings)
+        self.discovery = DiscoveryService(self.db, settings)
+        self.model_monitor = ModelMonitor(self.db, settings)
+
+    def start(self) -> None:
+        self.collector.start()
+        self.discovery.start()
+        self.model_monitor.start()
+
+    def stop(self) -> None:
+        self.model_monitor.stop()
+        self.discovery.stop()
+        self.collector.stop()
+
+    def get_thresholds(self) -> dict[str, Any]:
+        return {**DEFAULT_THRESHOLDS, **self.db.get_settings()}
+
+    def activate_discovered_hosts(self) -> None:
+        nodes = self.db.list_nodes()
+        for node in nodes:
+            if node["enabled"]:
+                self.collector.refresh_node(node)
+
+    def dashboard(self) -> dict[str, Any]:
+        thresholds = self.get_thresholds()
+        raw_nodes = self.db.list_nodes()
+        now = _now()
+        offline_after = max(5, int(thresholds.get("offline_seconds", 20)))
+        nodes: list[dict[str, Any]] = []
+        for raw in raw_nodes:
+            node = dict(raw)
+            metrics = node.get("latest_metrics")
+            last_seen = node.get("last_seen")
+            if not node["enabled"]:
+                status = "paused"
+            elif not last_seen:
+                status = "unknown"
+            elif now - int(last_seen) <= offline_after:
+                status = "online"
+            else:
+                status = "offline"
+            node["status"] = status
+            node["history"] = self.db.load_history(
+                int(node["id"]), self.settings.history_points
+            )
+            nodes.append(node)
+
+        online_nodes = [
+            node
+            for node in nodes
+            if node["status"] == "online" and node.get("latest_metrics")
+        ]
+
+        def average(path: tuple[str, ...]) -> float:
+            values: list[float] = []
+            for node in online_nodes:
+                current: Any = node.get("latest_metrics") or {}
+                for key in path:
+                    if not isinstance(current, dict):
+                        current = None
+                        break
+                    current = current.get(key)
+                if isinstance(current, (int, float)):
+                    values.append(float(current))
+            return round(sum(values) / len(values), 1) if values else 0.0
+
+        def gpu_average() -> float:
+            values: list[float] = []
+            for node in online_nodes:
+                gpus = (node.get("latest_metrics") or {}).get("gpus") or []
+                for gpu in gpus:
+                    utilization = gpu.get("load_percent", gpu.get("utilization"))
+                    if isinstance(utilization, (int, float)):
+                        values.append(float(utilization))
+            return round(sum(values) / len(values), 1) if values else 0.0
+
+        summary = {
+            "total": len(nodes),
+            "online": len(online_nodes),
+            "offline": sum(node["status"] == "offline" for node in nodes),
+            "paused": sum(node["status"] == "paused" for node in nodes),
+            "load_1_avg": average(("resources", "load_1")),
+            "cpu_count_avg": average(("resources", "cpu_count")),
+            "cpu_avg": average(("resources", "cpu_percent")),
+            "memory_avg": average(("resources", "memory_percent")),
+            "memory_used_total": round(
+                sum(
+                    float(
+                        (node.get("latest_metrics") or {})
+                        .get("resources", {})
+                        .get("memory_used", 0)
+                    )
+                    for node in online_nodes
+                )
+            ),
+            "memory_total_total": round(
+                sum(
+                    float(
+                        (node.get("latest_metrics") or {})
+                        .get("resources", {})
+                        .get("memory_total", 0)
+                    )
+                    for node in online_nodes
+                )
+            ),
+            "memory_available_total": round(
+                sum(
+                    float(
+                        (node.get("latest_metrics") or {})
+                        .get("resources", {})
+                        .get("memory_available", 0)
+                    )
+                    for node in online_nodes
+                )
+            ),
+            "gpu_avg": gpu_average(),
+            "temperature_max": max(
+                [
+                    float(node["latest_metrics"]["resources"].get("temperature_max") or 0)
+                    for node in online_nodes
+                ]
+                or [0]
+            ),
+            "rx_rate": round(
+                sum(
+                    float(
+                        (node.get("latest_metrics") or {})
+                        .get("resources", {})
+                        .get("rx_rate", 0)
+                    )
+                    for node in online_nodes
+                ),
+                1,
+            ),
+            "tx_rate": round(
+                sum(
+                    float(
+                        (node.get("latest_metrics") or {})
+                        .get("resources", {})
+                        .get("tx_rate", 0)
+                    )
+                    for node in online_nodes
+                ),
+                1,
+            ),
+        }
+
+        alerts = self._build_alerts(nodes, thresholds, now)
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for node in nodes:
+            groups.setdefault(node.get("group_name") or "未分组", []).append(node)
+        group_list = [
+            {"name": name, "nodes": group_nodes}
+            for name, group_nodes in sorted(groups.items(), key=lambda item: item[0])
+        ]
+        return {
+            "generated_at": now,
+            "summary": summary,
+            "groups": group_list,
+            "nodes": nodes,
+            "alerts": alerts,
+            "thresholds": thresholds,
+            "poll_interval": self.settings.poll_interval,
+        }
+
+    @staticmethod
+    def _build_alerts(
+        nodes: list[dict[str, Any]], thresholds: dict[str, Any], now: int
+    ) -> list[dict[str, Any]]:
+        alerts: list[dict[str, Any]] = []
+        for node in nodes:
+            metrics = node.get("latest_metrics") or {}
+            resources = metrics.get("resources") or {}
+            gpus = metrics.get("gpus") or []
+            gpu_values = [
+                float(gpu.get("load_percent", gpu.get("utilization")))
+                for gpu in gpus
+                if isinstance(gpu.get("load_percent", gpu.get("utilization")), (int, float))
+            ]
+            current = {
+                "cpu": float(resources.get("cpu_percent") or 0),
+                "memory": float(resources.get("memory_percent") or 0),
+                "gpu": max(gpu_values) if gpu_values else 0,
+                "temperature": float(resources.get("temperature_max") or 0),
+            }
+            checks = (
+                ("cpu", "CPU", "cpu_warning", "warning"),
+                ("memory", "内存", "memory_warning", "warning"),
+                ("gpu", "GPU 负载", "gpu_warning", "warning"),
+                ("temperature", "温度", "temperature_warning", "critical"),
+            )
+            for metric, label, setting_key, severity in checks:
+                limit = float(thresholds.get(setting_key, 100))
+                if current[metric] >= limit:
+                    alerts.append(
+                        {
+                            "id": f"{node['id']}-{metric}",
+                            "node_id": node["id"],
+                            "node_name": node["name"],
+                            "host": node["host"],
+                            "type": metric,
+                            "severity": severity,
+                            "title": f"{label} 使用率偏高",
+                            "message": f"{current[metric]:.1f}% 已达到阈值 {limit:.0f}%",
+                            "value": current[metric],
+                            "threshold": limit,
+                            "ts": node.get("last_seen") or now,
+                        }
+                    )
+            if node["status"] == "offline":
+                alerts.append(
+                    {
+                        "id": f"{node['id']}-offline",
+                        "node_id": node["id"],
+                        "node_name": node["name"],
+                        "host": node["host"],
+                        "type": "offline",
+                        "severity": "critical",
+                        "title": "节点离线",
+                        "message": f"最近心跳于 {node.get('last_seen') or '未知'}",
+                        "value": 0,
+                        "threshold": int(thresholds.get("offline_seconds", 20)),
+                        "ts": now,
+                    }
+                )
+        severity_order = {"critical": 0, "warning": 1}
+        return sorted(
+            alerts,
+            key=lambda item: (severity_order.get(item["severity"], 2), item["node_name"]),
+        )
+
+
+class SparkGridServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address: tuple[str, int], application: SparkGridApp):
+        super().__init__(address, SparkGridHandler)
+        self.application = application
+
+
+class SparkGridHandler(BaseHTTPRequestHandler):
+    server: SparkGridServer
+    protocol_version = "HTTP/1.1"
+    server_version = f"SparkGrid/{__version__}"
+    sys_version = ""
+
+    @property
+    def app(self) -> SparkGridApp:
+        return self.server.application
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        LOGGER.info("%s - %s", self.client_address[0], fmt % args)
+
+    def do_GET(self) -> None:
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/api/health":
+                self._json(
+                    {
+                        "ok": True,
+                        "service": "spark-grid",
+                        "version": __version__,
+                        "uptime": _now() - self.app.started_at,
+                    }
+                )
+                return
+            if parsed.path == "/api/bootstrap":
+                self._json(
+                    {
+                        "setup_required": self.app.db.count_users() == 0,
+                        "version": __version__,
+                        "service": "spark-grid",
+                    }
+                )
+                return
+            if parsed.path.startswith("/api/"):
+                user, session, error = self._authenticate()
+                if error:
+                    return
+                if parsed.path == "/api/session":
+                    self._json(
+                        {
+                            "user": {
+                                "id": user["id"],
+                                "username": user["username"],
+                                "role": user["role"],
+                            },
+                            "csrf_token": session["csrf_token"],
+                            "expires_at": session["expires_at"],
+                        }
+                    )
+                elif parsed.path == "/api/dashboard":
+                    self._json(self.app.dashboard())
+                elif parsed.path == "/api/model/overview":
+                    self._json(self.app.model_monitor.overview())
+                elif parsed.path == "/api/model/logs":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    rank = (query.get("rank") or ["0"])[0]
+                    lines = _safe_int(
+                        (query.get("lines") or ["220"])[0], 220, 20, 1000
+                    )
+                    self._json(self.app.model_monitor.logs(rank, lines))
+                elif parsed.path == "/api/history/cluster":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    minutes = _safe_int(
+                        (query.get("minutes") or ["30"])[0], 30, 5, 1440
+                    )
+                    series = {
+                        str(node["id"]): self.app.db.load_history_range(
+                            int(node["id"]), minutes, max_points=120
+                        )
+                        for node in self.app.db.list_nodes()
+                    }
+                    self._json({"minutes": minutes, "series": series})
+                elif re.fullmatch(r"/api/nodes/\d+/history", parsed.path):
+                    match = re.fullmatch(r"/api/nodes/(\d+)/history", parsed.path)
+                    node = self.app.db.get_node(int(match.group(1)))
+                    if not node:
+                        self._error(404, "节点不存在")
+                        return
+                    query = urllib.parse.parse_qs(parsed.query)
+                    minutes = _safe_int(
+                        (query.get("minutes") or ["60"])[0], 60, 5, 1440
+                    )
+                    self._json(
+                        {
+                            "node": {
+                                "id": node["id"],
+                                "name": node["name"],
+                                "host": node["host"],
+                            },
+                            "minutes": minutes,
+                            "series": self.app.db.load_history_range(
+                                int(node["id"]), minutes
+                            ),
+                        }
+                    )
+                elif parsed.path == "/api/nodes":
+                    self._json({"nodes": self.app.db.list_nodes()})
+                elif parsed.path == "/api/discovery":
+                    self._json(
+                        {
+                            "discovered": self.app.db.list_discovered(),
+                            "scan": self.app.discovery.state(),
+                        }
+                    )
+                elif parsed.path == "/api/discovery/scan":
+                    self._json(self.app.discovery.state())
+                elif parsed.path == "/api/alerts":
+                    dashboard = self.app.dashboard()
+                    self._json(
+                        {
+                            "alerts": dashboard["alerts"],
+                            "generated_at": dashboard["generated_at"],
+                        }
+                    )
+                elif parsed.path == "/api/audit":
+                    self._json({"logs": self.app.db.list_audit(150)})
+                elif parsed.path == "/api/settings":
+                    self._json({"settings": self.app.get_thresholds()})
+                elif parsed.path == "/api/export/nodes":
+                    self._export_nodes_csv()
+                else:
+                    self._error(404, "接口不存在")
+                return
+            self._serve_static(parsed.path)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception:
+            LOGGER.exception("GET request failed")
+            self._error(500, "服务器内部错误")
+
+    def do_POST(self) -> None:
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/api/login":
+                self._login()
+                return
+            if path == "/api/setup":
+                self._setup()
+                return
+            user, session, error = self._authenticate()
+            if error:
+                return
+            if not self._check_csrf(session):
+                return
+            if path == "/api/logout":
+                self.app.db.delete_session(session["token_hash"])
+                self._json({"ok": True}, set_cookie=self._cleared_cookie())
+                return
+            if path == "/api/nodes":
+                self._create_node(user)
+                return
+            if path == "/api/nodes/bulk":
+                self._bulk_add_nodes(user)
+                return
+            if path == "/api/nodes/batch":
+                self._batch_nodes(user)
+                return
+            if path == "/api/discovery/scan":
+                payload = self._read_json(optional=True) or {}
+                state = self.app.discovery.start_scan(payload.get("cidrs"))
+                self.app.db.add_audit(
+                    user, "discovery.scan", "network", "启动局域网扫描", self.client_address[0]
+                )
+                self._json({"scan": state})
+                return
+            if path == "/api/discovery/import":
+                self._import_discovered(user)
+                return
+            match = re.fullmatch(r"/api/nodes/(\d+)/refresh", path)
+            if match:
+                node = self.app.db.get_node(int(match.group(1)))
+                if not node:
+                    self._error(404, "节点不存在")
+                    return
+                metrics = self.app.collector.refresh_node(node)
+                if metrics is None:
+                    self._error(502, "节点未响应")
+                    return
+                self.app.db.add_audit(
+                    user,
+                    "node.refresh",
+                    node["host"],
+                    "手动刷新节点指标",
+                    self.client_address[0],
+                )
+                self._json({"ok": True, "metrics": metrics})
+                return
+            self._error(404, "接口不存在")
+        except ValueError as exc:
+            self._error(400, str(exc) or "请求内容无效")
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception:
+            LOGGER.exception("POST request failed")
+            self._error(500, "服务器内部错误")
+
+    def do_PATCH(self) -> None:
+        try:
+            user, session, error = self._authenticate()
+            if error:
+                return
+            if not self._check_csrf(session):
+                return
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/api/settings":
+                payload = self._read_json()
+                allowed = {
+                    "cpu_warning",
+                    "memory_warning",
+                    "gpu_warning",
+                    "temperature_warning",
+                    "offline_seconds",
+                }
+                values = {
+                    key: _safe_int(value, DEFAULT_THRESHOLDS[key], 1, 86400)
+                    for key, value in payload.items()
+                    if key in allowed
+                }
+                updated = self.app.db.update_settings(values)
+                self.app.db.add_audit(
+                    user,
+                    "settings.update",
+                    "thresholds",
+                    json.dumps(values, ensure_ascii=False),
+                    self.client_address[0],
+                )
+                self._json({"settings": {**DEFAULT_THRESHOLDS, **updated}})
+                return
+            match = re.fullmatch(r"/api/nodes/(\d+)", path)
+            if match:
+                self._update_node(user, int(match.group(1)))
+                return
+            self._error(404, "接口不存在")
+        except ValueError as exc:
+            self._error(400, str(exc) or "请求内容无效")
+        except Exception:
+            LOGGER.exception("PATCH request failed")
+            self._error(500, "服务器内部错误")
+
+    def do_DELETE(self) -> None:
+        try:
+            user, session, error = self._authenticate()
+            if error:
+                return
+            if not self._check_csrf(session):
+                return
+            match = re.fullmatch(
+                r"/api/nodes/(\d+)", urllib.parse.urlparse(self.path).path
+            )
+            if not match:
+                self._error(404, "接口不存在")
+                return
+            node = self.app.db.get_node(int(match.group(1)))
+            if not node:
+                self._error(404, "节点不存在")
+                return
+            self.app.db.delete_nodes([int(match.group(1))])
+            self.app.db.add_audit(
+                user, "node.delete", node["host"], node["name"], self.client_address[0]
+            )
+            self._json({"ok": True})
+        except Exception:
+            LOGGER.exception("DELETE request failed")
+            self._error(500, "服务器内部错误")
+
+    def _login(self) -> None:
+        if self.app.db.count_users() == 0:
+            self._error(409, "请先完成管理员初始化")
+            return
+        remote_addr = self.client_address[0]
+        if not self.app.throttle.allowed(remote_addr):
+            self._error(429, "登录尝试过多，请稍后再试")
+            return
+        payload = self._read_json()
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        user = self.app.db.get_user_by_username(username)
+        if not user or not verify_password(password, user["password_hash"]):
+            self.app.throttle.record_failure(remote_addr)
+            self._error(401, "用户名或密码错误")
+            return
+        self.app.throttle.reset(remote_addr)
+        token, session = create_session(
+            self.app.db,
+            int(user["id"]),
+            remote_addr,
+            self.headers.get("User-Agent", ""),
+        )
+        self.app.db.mark_login(int(user["id"]))
+        self.app.db.add_audit(
+            user, "auth.login", "session", "管理员登录", remote_addr
+        )
+        cookie = self._session_cookie(token, session["expires_at"])
+        self._json(
+            {
+                "user": {
+                    "id": user["id"],
+                    "username": user["username"],
+                    "role": user["role"],
+                },
+                "csrf_token": session["csrf_token"],
+                "expires_at": session["expires_at"],
+            },
+            set_cookie=cookie,
+        )
+
+    def _setup(self) -> None:
+        if self.app.db.count_users() > 0:
+            self._error(409, "管理员已初始化")
+            return
+        payload = self._read_json()
+        username = str(payload.get("username", "admin")).strip()
+        password = str(payload.get("password", ""))
+        if not USERNAME_RE.fullmatch(username):
+            self._error(400, "用户名需为 3-32 位字母、数字、点、横线或下划线")
+            return
+        if len(password) < 10:
+            self._error(400, "密码至少需要 10 个字符")
+            return
+        user = self.app.db.create_user(username, hash_password(password))
+        token, session = create_session(
+            self.app.db,
+            int(user["id"]),
+            self.client_address[0],
+            self.headers.get("User-Agent", ""),
+        )
+        self.app.db.add_audit(
+            user, "auth.setup", "user", "初始化管理员账号", self.client_address[0]
+        )
+        cookie = self._session_cookie(token, session["expires_at"])
+        self._json(
+            {
+                "user": user,
+                "csrf_token": session["csrf_token"],
+                "expires_at": session["expires_at"],
+            },
+            status=201,
+            set_cookie=cookie,
+        )
+
+    def _authenticate(
+        self,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+        token = self._session_token()
+        if not token:
+            self._error(401, "请先登录")
+            return None, None, True
+        session = self.app.db.get_session(token_hash(token))
+        if not session:
+            self._error(401, "登录已过期", set_cookie=self._cleared_cookie())
+            return None, None, True
+        user = {
+            "id": session["user_id"],
+            "username": session["username"],
+            "role": session["role"],
+        }
+        return user, session, False
+
+    def _check_csrf(self, session: dict[str, Any]) -> bool:
+        supplied = self.headers.get("X-CSRF-Token", "")
+        valid = bool(supplied) and hmac.compare_digest(
+            supplied, str(session.get("csrf_token", ""))
+        )
+        if not valid:
+            self._error(403, "CSRF 校验失败")
+        return valid
+
+    def _create_node(self, user: dict[str, Any]) -> None:
+        payload = self._read_json()
+        host = str(payload.get("host", "")).strip()
+        if not HOST_RE.fullmatch(host):
+            self._error(400, "节点地址格式无效")
+            return
+        if self.app.db.get_node_by_host(host):
+            self._error(409, "节点已存在")
+            return
+        ssh_user = str(payload.get("ssh_user") or self.app.settings.ssh_user).strip()
+        if not SSH_USER_RE.fullmatch(ssh_user):
+            self._error(400, "SSH 用户名格式无效")
+            return
+        node = self.app.db.add_node(
+            host=host,
+            name=str(payload.get("name") or _default_name(host)).strip(),
+            ssh_port=_safe_int(payload.get("ssh_port"), 22, 1, 65535),
+            ssh_user=ssh_user,
+            ssh_key_path=str(payload.get("ssh_key_path") or self.app.settings.ssh_key_path).strip(),
+            group_name=str(payload.get("group_name") or "未分组").strip(),
+            tags=_tags(payload.get("tags")),
+        )
+        self.app.db.add_audit(
+            user, "node.create", host, node["name"], self.client_address[0]
+        )
+        self._json({"node": node}, status=201)
+
+    def _bulk_add_nodes(self, user: dict[str, Any]) -> None:
+        payload = self._read_json()
+        default_group = str(payload.get("group_name") or "未分组").strip()
+        default_tags = _tags(payload.get("tags"))
+        ssh_port = _safe_int(payload.get("ssh_port"), 22, 1, 65535)
+        ssh_user = str(payload.get("ssh_user") or self.app.settings.ssh_user).strip()
+        if not SSH_USER_RE.fullmatch(ssh_user):
+            self._error(400, "SSH 用户名格式无效")
+            return
+        ssh_key_path = str(
+            payload.get("ssh_key_path") or self.app.settings.ssh_key_path
+        ).strip()
+        items, errors = _parse_bulk_lines(
+            str(payload.get("input", "")),
+            default_group,
+            default_tags,
+            ssh_port,
+            ssh_user,
+            ssh_key_path,
+        )
+        if not items:
+            self._error(400, "没有可添加的节点地址")
+            return
+        added: list[dict[str, Any]] = []
+        skipped: list[str] = []
+        for item in items:
+            if self.app.db.get_node_by_host(item["host"]):
+                skipped.append(item["host"])
+                continue
+            try:
+                added.append(
+                    self.app.db.add_node(
+                        host=item["host"],
+                        name=item["name"],
+                        ssh_port=item["ssh_port"],
+                        ssh_user=item["ssh_user"],
+                        ssh_key_path=item["ssh_key_path"],
+                        group_name=item["group_name"],
+                        tags=item["tags"],
+                    )
+                )
+            except sqlite3.IntegrityError:
+                skipped.append(item["host"])
+        self.app.db.add_audit(
+            user,
+            "node.bulk_add",
+            "nodes",
+            f"新增 {len(added)}，跳过 {len(skipped)}",
+            self.client_address[0],
+        )
+        self._json(
+            {
+                "added": len(added),
+                "skipped": skipped,
+                "errors": errors,
+                "nodes": added,
+            },
+            status=201 if added else 200,
+        )
+
+    def _batch_nodes(self, user: dict[str, Any]) -> None:
+        payload = self._read_json()
+        ids = [
+            int(value)
+            for value in payload.get("ids", [])
+            if isinstance(value, int) or str(value).isdigit()
+        ]
+        if not ids:
+            self._error(400, "请选择节点")
+            return
+        action = str(payload.get("action", ""))
+        affected = 0
+        if action == "enable":
+            affected = self.app.db.set_nodes_enabled(ids, True)
+        elif action == "disable":
+            affected = self.app.db.set_nodes_enabled(ids, False)
+        elif action == "delete":
+            affected = self.app.db.delete_nodes(ids)
+        elif action in {"group", "tags"}:
+            for node_id in ids:
+                fields: dict[str, Any] = {}
+                if action == "group":
+                    fields["group_name"] = str(payload.get("group_name") or "未分组")
+                else:
+                    fields["tags"] = _tags(payload.get("tags"))
+                if self.app.db.update_node(node_id, fields):
+                    affected += 1
+        else:
+            self._error(400, "不支持的批量操作")
+            return
+        self.app.db.add_audit(
+            user,
+            f"node.batch_{action}",
+            ",".join(str(value) for value in ids[:20]),
+            f"影响 {affected} 个节点",
+            self.client_address[0],
+        )
+        self._json({"ok": True, "affected": affected})
+
+    def _update_node(self, user: dict[str, Any], node_id: int) -> None:
+        node = self.app.db.get_node(node_id)
+        if not node:
+            self._error(404, "节点不存在")
+            return
+        payload = self._read_json()
+        fields: dict[str, Any] = {}
+        if "name" in payload:
+            name = str(payload["name"]).strip()
+            if not name:
+                self._error(400, "节点名称不能为空")
+                return
+            fields["name"] = name[:80]
+        if "host" in payload:
+            host = str(payload["host"]).strip()
+            if not HOST_RE.fullmatch(host):
+                self._error(400, "节点地址格式无效")
+                return
+            fields["host"] = host
+        if "ssh_port" in payload:
+            fields["ssh_port"] = _safe_int(payload["ssh_port"], 22, 1, 65535)
+        if "ssh_user" in payload:
+            user_value = str(payload["ssh_user"]).strip()
+            if not SSH_USER_RE.fullmatch(user_value):
+                self._error(400, "SSH 用户名格式无效")
+                return
+            fields["ssh_user"] = user_value
+        if "ssh_key_path" in payload:
+            fields["ssh_key_path"] = str(payload["ssh_key_path"]).strip()[:500]
+        if "group_name" in payload:
+            fields["group_name"] = str(payload["group_name"]).strip()[:80] or "未分组"
+        if "tags" in payload:
+            fields["tags"] = _tags(payload["tags"])
+        if "enabled" in payload:
+            fields["enabled"] = bool(payload["enabled"])
+        try:
+            updated = self.app.db.update_node(node_id, fields)
+        except sqlite3.IntegrityError:
+            self._error(409, "节点地址已存在")
+            return
+        self.app.db.add_audit(
+            user,
+            "node.update",
+            node["host"],
+            json.dumps(fields, ensure_ascii=False),
+            self.client_address[0],
+        )
+        self._json({"node": updated})
+
+    def _import_discovered(self, user: dict[str, Any]) -> None:
+        payload = self._read_json()
+        hosts = [str(value) for value in payload.get("hosts", [])]
+        group_name = str(payload.get("group_name") or "自动发现")
+        discovered = {item["host"]: item for item in self.app.db.list_discovered(86400)}
+        added = 0
+        skipped: list[str] = []
+        for host in hosts:
+            if self.app.db.get_node_by_host(host):
+                skipped.append(host)
+                continue
+            info = discovered.get(host, {})
+            try:
+                self.app.db.add_node(
+                    host=host,
+                    name=info.get("name") or _default_name(host),
+                    ssh_port=int(info.get("ssh_port") or self.app.settings.ssh_port),
+                    ssh_user=str(info.get("ssh_user") or self.app.settings.ssh_user),
+                    ssh_key_path=str(
+                        info.get("ssh_key_path") or self.app.settings.ssh_key_path
+                    ),
+                    group_name=group_name,
+                    tags=["auto-discovery"],
+                )
+                added += 1
+            except sqlite3.IntegrityError:
+                skipped.append(host)
+        self.app.db.add_audit(
+            user,
+            "discovery.import",
+            ",".join(hosts[:20]),
+            f"新增 {added}，跳过 {len(skipped)}",
+            self.client_address[0],
+        )
+        self._json({"added": added, "skipped": skipped})
+
+    def _export_nodes_csv(self) -> None:
+        nodes = self.app.db.list_nodes()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(
+            [
+                "name",
+                "host",
+                "ssh_port",
+                "ssh_user",
+                "ssh_key_path",
+                "group_name",
+                "tags",
+                "enabled",
+                "status",
+            ]
+        )
+        for node in nodes:
+            writer.writerow(
+                [
+                    node["name"],
+                    node["host"],
+                    node["ssh_port"],
+                    node["ssh_user"],
+                    node["ssh_key_path"],
+                    node["group_name"],
+                    "|".join(node["tags"]),
+                    "1" if node["enabled"] else "0",
+                    node["last_status"],
+                ]
+            )
+        body = ("\ufeff" + output.getvalue()).encode("utf-8")
+        self.send_response(200)
+        self._security_headers()
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header(
+            "Content-Disposition", 'attachment; filename="spark-nodes.csv"'
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_static(self, path: str) -> None:
+        static_dir = self.app.settings.static_dir.resolve()
+        if path in {"", "/"}:
+            target = static_dir / "index.html"
+        else:
+            relative = urllib.parse.unquote(path.lstrip("/"))
+            target = (static_dir / relative).resolve()
+            try:
+                target.relative_to(static_dir)
+            except ValueError:
+                self._error(404, "页面不存在")
+                return
+        if not target.is_file():
+            if "." not in path.rsplit("/", 1)[-1]:
+                target = static_dir / "index.html"
+            else:
+                self._error(404, "文件不存在")
+                return
+        content = target.read_bytes()
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {
+            "application/javascript",
+            "application/json",
+            "image/svg+xml",
+        }:
+            content_type += "; charset=utf-8"
+        self.send_response(200)
+        self._security_headers()
+        self.send_header("Content-Type", content_type)
+        cache = (
+            "no-cache"
+            if target.name in {"index.html", "app.css", "app.js"}
+            else "public, max-age=3600"
+        )
+        self.send_header("Cache-Control", cache)
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _read_json(self, optional: bool = False) -> dict[str, Any]:
+        length = _safe_int(self.headers.get("Content-Length"), 0, 0, 2_000_000)
+        if length == 0:
+            if optional:
+                return {}
+            raise ValueError("missing JSON body")
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def _json(
+        self, payload: Any, status: int = 200, set_cookie: str | None = None
+    ) -> None:
+        body = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        self.send_response(status)
+        self._security_headers()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _error(
+        self, status: int, message: str, set_cookie: str | None = None
+    ) -> None:
+        self._json({"error": message}, status=status, set_cookie=set_cookie)
+
+    def _security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+        )
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+
+    def _session_token(self) -> str:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
+        morsel = cookie.get(SESSION_COOKIE)
+        return morsel.value if morsel else ""
+
+    def _session_cookie(self, token: str, expires_at: int) -> str:
+        max_age = max(1, expires_at - _now())
+        parts = [
+            f"{SESSION_COOKIE}={token}",
+            "Path=/",
+            f"Max-Age={max_age}",
+            "HttpOnly",
+            "SameSite=Strict",
+        ]
+        if self.app.settings.cookie_secure:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _cleared_cookie() -> str:
+        return f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+
+
+def run(settings: Settings) -> None:
+    logging.basicConfig(
+        level=os.getenv("SPARK_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    application = SparkGridApp(settings)
+    application.start()
+    server = SparkGridServer((settings.host, settings.port), application)
+    LOGGER.info(
+        "Spark Grid %s listening on http://%s:%s (SSH pull, user %s)",
+        __version__,
+        settings.host,
+        settings.port,
+        settings.ssh_user,
+    )
+    print(
+        f"Spark Grid {__version__} running at http://{settings.host}:{settings.port}",
+        flush=True,
+    )
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        application.stop()
+        server.server_close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Spark Grid monitoring platform")
+    parser.add_argument("--host", default=None, help="listen address")
+    parser.add_argument("--port", type=int, default=None, help="listen port")
+    args = parser.parse_args()
+    current = load_settings()
+    if args.host or args.port:
+        from dataclasses import replace
+
+        current = replace(
+            current,
+            host=args.host or current.host,
+            port=args.port or current.port,
+        )
+    run(current)
+
+
+if __name__ == "__main__":
+    main()
