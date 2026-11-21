@@ -139,11 +139,17 @@ def _display_vllm_time(value: str | None) -> str | None:
         return value
 
 
+def _parse_docker_timestamp(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    normalized = re.sub(r"(\.\d{6})\d+", r"\1", normalized)
+    return datetime.fromisoformat(normalized)
+
+
 def _docker_since(value: str | None) -> str | None:
     if not value:
         return None
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        _parse_docker_timestamp(value)
     except ValueError:
         return None
     return value
@@ -475,7 +481,7 @@ class ModelMonitor:
             try:
                 uptime = int(
                     time.time()
-                    - datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
+                    - _parse_docker_timestamp(started_at).timestamp()
                 )
             except ValueError:
                 pass
