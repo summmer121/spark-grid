@@ -1287,6 +1287,18 @@ class ModelControlParsingTests(unittest.TestCase):
             ["model-glm53-guard.service"],
         )
 
+    def test_list_script_separates_ports_with_spaces(self):
+        from types import SimpleNamespace
+
+        class _Runtime:
+            def current(self):
+                return SimpleNamespace(model_ports=[8888, 8000])
+
+        self.control.config = _Runtime()
+        script = self.control._list_script()
+        self.assertIn("for p in 8888 8000; do", script)
+        self.assertNotIn("8888,8000", script)
+
     def test_parse_duration_usec(self):
         from app.model_control import _parse_duration_usec
 

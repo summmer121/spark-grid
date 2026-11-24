@@ -52,7 +52,7 @@ docker ps --format '{{.Names}}|{{.State}}' 2>/dev/null | head -80
 echo "END_CONTAINERS"
 echo "PORTS"
 for p in %s; do
-  code=$(curl -s -o /dev/null -m 2 -w '%%{http_code}' "http://127.0.0.1:$p/health" 2>/dev/null || echo 000)
+  code=$(curl -s -o /dev/null -m 2 -w '%%{http_code}' "http://127.0.0.1:$p/health" 2>/dev/null || true)
   echo "HEALTH:$p:$code"
 done
 echo "END_PORTS"
@@ -203,7 +203,7 @@ class ModelControl:
         return value
 
     def _list_script(self) -> str:
-        ports = ",".join(str(port) for port in self._current().model_ports) or "8888"
+        ports = " ".join(str(port) for port in self._current().model_ports) or "8888"
         return LIST_SCRIPT % ports
 
     # ------------------------------------------------------------- parsing
