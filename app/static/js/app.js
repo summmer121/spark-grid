@@ -3489,7 +3489,9 @@
         } else if (action === "modal-backdrop") {
           if (event.target === actionElement) closeModal();
         } else if (action === "confirm-modal") {
-          if (state.confirmAction) await state.confirmAction();
+          const confirmAction = state.confirmAction;
+          closeModal();
+          if (confirmAction) await confirmAction();
         } else if (action === "close-drawer") {
           closeDrawer();
         } else if (action === "refresh-node") {
