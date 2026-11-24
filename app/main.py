@@ -32,6 +32,7 @@ from .collector import MetricsCollector
 from .config import Settings, load_settings
 from .db import Database, sanitize_error_message
 from .discovery import DiscoveryService
+from .model_chat import ChatError, ModelChat
 from .model_control import ModelControl, ModelControlError
 from .model_monitor import ModelMonitor
 from .runtime_config import RuntimeConfig
@@ -218,6 +219,7 @@ class SparkGridApp:
         self.discovery = DiscoveryService(self.db, self.config)
         self.model_monitor = ModelMonitor(self.db, self.config)
         self.model_control = ModelControl(self.db, self.config)
+        self.model_chat = ModelChat(self.db, self.config, self.model_control)
 
     def start(self) -> None:
         self.collector.start()
@@ -568,6 +570,8 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                     self._json(self.app.model_monitor.overview())
                 elif parsed.path == "/api/model/services":
                     self._json(self.app.model_control.list_services())
+                elif parsed.path == "/api/model/chat/info":
+                    self._json(self.app.model_chat.info())
                 elif parsed.path == "/api/model/logs":
                     config = self.app.config.current()
                     query = urllib.parse.parse_qs(parsed.query)
@@ -689,6 +693,9 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/model/services/action":
                 self._model_service_action(user)
+                return
+            if path == "/api/model/chat":
+                self._model_chat()
                 return
             if path == "/api/nodes/bulk":
                 self._bulk_add_nodes(user)
@@ -1026,6 +1033,15 @@ class SparkGridHandler(BaseHTTPRequestHandler):
         if not valid:
             self._error(403, "CSRF 校验失败")
         return valid
+
+    def _model_chat(self) -> None:
+        payload = self._read_json()
+        try:
+            result = self.app.model_chat.chat(payload)
+        except ChatError as exc:
+            self._error(502, str(exc))
+            return
+        self._json(result)
 
     def _model_service_action(self, user: dict[str, Any] | None) -> None:
         payload = self._read_json()

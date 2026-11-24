@@ -1193,6 +1193,31 @@ class HttpIntegrationTests(unittest.TestCase):
         self.assertNotIn("ssh_password", serialized)
 
 
+class ModelChatValidationTests(unittest.TestCase):
+    """Input validation for the chat playground proxy."""
+
+    def setUp(self):
+        from app.model_chat import ModelChat
+
+        self.chat = ModelChat.__new__(ModelChat)
+
+    def test_rejects_empty_messages(self):
+        from app.model_chat import ChatError
+
+        with self.assertRaises(ChatError):
+            self.chat.chat({"messages": []})
+        with self.assertRaises(ChatError):
+            self.chat.chat({})
+
+    def test_rejects_messages_without_valid_role(self):
+        from app.model_chat import ChatError
+
+        with self.assertRaises(ChatError):
+            self.chat.chat({"messages": [{"role": "tool", "content": "x"}]})
+        with self.assertRaises(ChatError):
+            self.chat.chat({"messages": [{"role": "user", "content": ""}]})
+
+
 class ModelControlParsingTests(unittest.TestCase):
     """Parsing and validation for HEAD model_* service control."""
 

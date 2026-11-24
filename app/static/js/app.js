@@ -9,6 +9,13 @@
     authMode: "login",
     dashboard: null,
     alertRules: null,
+    chatInfo: null,
+    chat: {
+      messages: [],
+      busy: false,
+      lastStats: null,
+      totals: { turns: 0, prompt: 0, completion: 0, genMs: 0 },
+    },
     discovery: null,
     audit: [],
     settings: null,
@@ -54,6 +61,7 @@
   const viewMeta = {
     overview: { eyebrow: "CLUSTER OVERVIEW", title: "集群总览" },
     model: { eyebrow: "MODEL RUNTIME", title: "模型管理" },
+    chat: { eyebrow: "MODEL TEST", title: "模型测试" },
     nodes: { eyebrow: "NODE INVENTORY", title: "节点管理" },
     discovery: { eyebrow: "LAN DISCOVERY", title: "局域网发现" },
     alerts: { eyebrow: "ALERT CENTER", title: "告警中心" },
@@ -700,6 +708,7 @@
     if (loadData) {
       if (view === "discovery") loadDiscovery();
       if (view === "alerts") loadAlertRules();
+      if (view === "chat") loadChatInfo();
       if (view === "audit") loadAudit();
       if (view === "model") {
         loadModelOverview();
@@ -731,6 +740,9 @@
         break;
       case "model":
         renderModel();
+        break;
+      case "chat":
+        renderChat();
         break;
       case "settings":
         renderSettings();
@@ -851,6 +863,16 @@
         <ul>
           <li><strong>GPU 负载</strong>为驱动利用率，<strong>统一内存</strong>为 GB10 统一内存占用。</li>
           <li><strong>网络吞吐</strong>为节点网卡收发速率合计。</li>
+        </ul>`,
+    },
+    chat: {
+      title: "模型测试说明",
+      html: `<p>通过 OpenAI 兼容接口直接和运行中的模型对话，用于验证服务可用性与生成性能。</p>
+        <ul>
+          <li><strong>输入 / 输出 Token</strong>：取自引擎返回的 usage（<code>stream_options.include_usage</code>）。</li>
+          <li><strong>TTFT</strong>：从发出请求到收到第一个内容 token 的时间，反映 prefill 速度。</li>
+          <li><strong>吞吐</strong>：输出 token 数除以首 token 之后的生成耗时（tok/s）。</li>
+          <li>请求由中心服务转发到 HEAD 节点的模型端口，API Key 从容器 secret 读取，不会出现在页面或日志中。</li>
         </ul>`,
     },
     "model-logs": {
@@ -2343,6 +2365,158 @@
     ];
   }
 
+  async function loadChatInfo() {
+    try {
+      state.chatInfo = await api("/api/model/chat/info");
+    } catch (error) {
+      state.chatInfo = { available: false, error: error.message, models: [], endpoint: "" };
+    }
+    if (state.view === "chat") renderChat();
+  }
+
+  function formatChatMs(value) {
+    if (value == null || !Number.isFinite(Number(value))) return "—";
+    const ms = Number(value);
+    if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+    return `${ms.toFixed(0)} ms`;
+  }
+
+  function chatMessageHtml(message) {
+    const isUser = message.role === "user";
+    const m = message.metrics;
+    const metricsHtml = m
+      ? `<div class="chat-bubble-metrics">输入 ${m.prompt_tokens} tok · 输出 ${m.completion_tokens} tok · TTFT ${formatChatMs(m.ttft_ms)} · 总 ${formatChatMs(m.total_ms)} · ${m.throughput} tok/s</div>`
+      : "";
+    const reasoningHtml =
+      !isUser && message.reasoning
+        ? `<details class="chat-reasoning"><summary>思考过程 · ${message.reasoning.length} 字符</summary><div>${escapeHtml(message.reasoning)}</div></details>`
+        : "";
+    const body = message.content || (message.reasoning ? "（仅输出思考内容，未产生正式回复）" : "(空响应)");
+    return `
+      <div class="chat-bubble ${isUser ? "user" : "assistant"}">
+        <div class="chat-bubble-role">${isUser ? "你" : "模型"}</div>
+        ${reasoningHtml}
+        <div class="chat-bubble-content">${escapeHtml(body)}</div>
+        ${metricsHtml}
+      </div>`;
+  }
+
+  function renderChatMessages() {
+    const box = $("#chatMessages");
+    if (!box) return;
+    box.innerHTML = state.chat.messages.length
+      ? state.chat.messages.map(chatMessageHtml).join("")
+      : `<div class="chat-empty">${icon("message-square-dashed")}<span>发送一条消息开始测试</span></div>`;
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function chatStatsHtml() {
+    const last = state.chat.lastStats;
+    const totals = state.chat.totals;
+    const avg = totals.genMs > 0 ? (totals.completion / (totals.genMs / 1000)).toFixed(1) : "—";
+    return `
+      <div class="chat-side-title">本轮指标 <small>THIS TURN</small></div>
+      <div class="chat-stat-grid">
+        <div class="chat-stat"><span>输入 Token</span><strong>${last ? last.prompt_tokens : "—"}</strong></div>
+        <div class="chat-stat"><span>输出 Token</span><strong>${last ? last.completion_tokens : "—"}</strong></div>
+        <div class="chat-stat"><span>TTFT</span><strong>${last ? formatChatMs(last.ttft_ms) : "—"}</strong></div>
+        <div class="chat-stat"><span>总耗时</span><strong>${last ? formatChatMs(last.total_ms) : "—"}</strong></div>
+        <div class="chat-stat"><span>吞吐</span><strong>${last ? `${last.throughput} tok/s` : "—"}</strong></div>
+        <div class="chat-stat"><span>结束原因</span><strong>${last?.finish_reason || "—"}</strong></div>
+      </div>
+      <div class="chat-total">
+        <span>会话累计 <small>SESSION</small></span>
+        <strong>${totals.turns} 轮 · 输入 ${totals.prompt} · 输出 ${totals.completion} tok</strong>
+        <small>平均生成 ${avg} tok/s</small>
+      </div>`;
+  }
+
+  function renderChat() {
+    const info = state.chatInfo;
+    const models = info?.models || [];
+    const options = models.length
+      ? models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("")
+      : '<option value="">未发现模型</option>';
+    const busy = state.chat.busy;
+    $("#content").innerHTML = `
+      ${pageHead(
+        "模型测试",
+        info ? (info.available ? `已连接 ${info.endpoint}` : "模型服务不可用") : "正在检测模型服务",
+        `<button class="button ghost compact" data-action="chat-reset">${icon("rotate-ccw")}<span>新会话</span></button>`,
+        "chat",
+      )}
+      ${info && info.available === false ? `<div class="panel chat-offline">${icon("alert-triangle")}<span>${escapeHtml(info.error || "模型服务不可用")}</span></div>` : ""}
+      <section class="chat-layout">
+        <div class="chat-main">
+          <div class="chat-toolbar">
+            <label class="chat-field">模型<select id="chatModel" class="select">${options}</select></label>
+            <label class="chat-field">最大输出<input id="chatMaxTokens" class="text-input" type="number" value="512" min="1" max="8192"></label>
+            <label class="chat-field">温度<input id="chatTemperature" class="text-input" type="number" value="0.7" min="0" max="2" step="0.1"></label>
+            <label class="chat-field chat-check"><input id="chatThinking" type="checkbox"> 启用思考</label>
+          </div>
+          <div class="chat-messages" id="chatMessages"></div>
+          <div class="chat-composer">
+            <textarea id="chatInput" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行" ${busy ? "disabled" : ""}></textarea>
+            <button class="primary-button" data-action="chat-send" ${busy ? "disabled" : ""}>${icon(busy ? "loader-circle" : "send")}<span>${busy ? "生成中" : "发送"}</span></button>
+          </div>
+        </div>
+        <aside class="chat-side ${busy ? "busy" : ""}">${chatStatsHtml()}</aside>
+      </section>`;
+    renderChatMessages();
+    refreshIcons($("#content"));
+  }
+
+  async function sendChat() {
+    if (state.chat.busy) return;
+    const input = $("#chatInput");
+    const text = (input?.value || "").trim();
+    if (!text) return;
+    state.chat.messages.push({ role: "user", content: text });
+    state.chat.busy = true;
+    const modelValue = $("#chatModel")?.value || "";
+    const maxTokens = Number($("#chatMaxTokens")?.value) || 512;
+    const temperature = Number($("#chatTemperature")?.value ?? 0.7);
+    renderChat();
+    try {
+      const payload = await api("/api/model/chat", {
+        method: "POST",
+        body: {
+          model: modelValue,
+          max_tokens: maxTokens,
+          temperature,
+          enable_thinking: Boolean($("#chatThinking")?.checked),
+          messages: state.chat.messages.map((m) => ({ role: m.role, content: m.content })),
+        },
+      });
+      state.chat.lastStats = { ...(payload.usage || {}), ...(payload.metrics || {}) };
+      state.chat.messages.push({
+        role: "assistant",
+        content: payload.content || "",
+        reasoning: payload.reasoning || "",
+        metrics: state.chat.lastStats,
+      });
+      const totals = state.chat.totals;
+      totals.turns += 1;
+      totals.prompt += Number(payload.usage?.prompt_tokens || 0);
+      totals.completion += Number(payload.usage?.completion_tokens || 0);
+      totals.genMs += Number(payload.metrics?.generation_ms || 0);
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      state.chat.busy = false;
+      if (state.view === "chat") renderChat();
+    }
+  }
+
+  function resetChat() {
+    confirmDialog("开始新会话", "将清空当前对话和统计。", "清空", () => {
+      state.chat.messages = [];
+      state.chat.lastStats = null;
+      state.chat.totals = { turns: 0, prompt: 0, completion: 0, genMs: 0 };
+      renderChat();
+    });
+  }
+
   function modelServiceStateInfo(service) {
     const phase = String(service.phase || "");
     const label = service.phase_label || "";
@@ -3543,6 +3717,10 @@
           askModelServiceAction("switch", actionElement.dataset.unit);
         } else if (action === "open-help") {
           openHelp(actionElement.dataset.help);
+        } else if (action === "chat-send") {
+          await sendChat();
+        } else if (action === "chat-reset") {
+          resetChat();
         } else if (action === "alert-rules-save") {
           await saveAlertRules();
         } else if (action === "alert-rules-reset") {
@@ -3655,6 +3833,16 @@
     });
 
     document.addEventListener("keydown", (event) => {
+      if (
+        event.target.id === "chatInput" &&
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        !event.isComposing
+      ) {
+        event.preventDefault();
+        sendChat();
+        return;
+      }
       const nodeCard = event.target.closest(".node-card[data-node-id]");
       if (nodeCard && (event.key === "Enter" || event.key === " ")) {
         event.preventDefault();
