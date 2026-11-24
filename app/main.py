@@ -32,6 +32,7 @@ from .collector import MetricsCollector
 from .config import Settings, load_settings
 from .db import Database, sanitize_error_message
 from .discovery import DiscoveryService
+from .model_control import ModelControl, ModelControlError
 from .model_monitor import ModelMonitor
 from .runtime_config import RuntimeConfig
 from .ssh_runner import SSHError, probe_via_ssh
@@ -41,6 +42,14 @@ LOGGER = logging.getLogger("spark-grid")
 SESSION_COOKIE = "spark_grid_session"
 HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+# (setting key, alert metric type, severity, display name)
+ALERT_RULES = (
+    ("cpu_warning", "cpu", "warning", "CPU 使用率"),
+    ("memory_warning", "memory", "warning", "内存使用率"),
+    ("gpu_warning", "gpu", "warning", "GPU 负载"),
+    ("temperature_warning", "temperature", "critical", "最高温度"),
+    ("offline_seconds", "offline", "critical", "离线判定"),
+)
 SSH_USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
@@ -208,6 +217,7 @@ class SparkGridApp:
         self.collector = MetricsCollector(self.db, self.config)
         self.discovery = DiscoveryService(self.db, self.config)
         self.model_monitor = ModelMonitor(self.db, self.config)
+        self.model_control = ModelControl(self.db, self.config)
 
     def start(self) -> None:
         self.collector.start()
@@ -390,6 +400,41 @@ class SparkGridApp:
             "session_ttl_hours": config.session_ttl_hours,
         }
 
+    def alert_rules(self) -> dict[str, Any]:
+        payload = self.config.public_payload()
+        fields = {field["key"]: field for field in payload["fields"]}
+        dashboard = self.dashboard()
+        counts: dict[str, int] = {}
+        for alert in dashboard["alerts"]:
+            metric = str(alert.get("type") or "")
+            counts[metric] = counts.get(metric, 0) + 1
+        rules = []
+        for key, metric, severity, display in ALERT_RULES:
+            field = fields.get(key)
+            if not field:
+                continue
+            rules.append(
+                {
+                    "key": key,
+                    "label": field["label"],
+                    "display": display,
+                    "description": field["description"],
+                    "unit": field["unit"],
+                    "value": field["value"],
+                    "default": field["default"],
+                    "min": field["min"],
+                    "max": field["max"],
+                    "severity": severity,
+                    "metric": metric,
+                    "triggered": counts.get(metric, 0),
+                }
+            )
+        return {
+            "rules": rules,
+            "alerts": len(dashboard["alerts"]),
+            "generated_at": _now(),
+        }
+
     @staticmethod
     def _build_alerts(
         nodes: list[dict[str, Any]], thresholds: dict[str, Any], now: int
@@ -521,6 +566,8 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                     self._json(self.app.dashboard())
                 elif parsed.path == "/api/model/overview":
                     self._json(self.app.model_monitor.overview())
+                elif parsed.path == "/api/model/services":
+                    self._json(self.app.model_control.list_services())
                 elif parsed.path == "/api/model/logs":
                     config = self.app.config.current()
                     query = urllib.parse.parse_qs(parsed.query)
@@ -593,6 +640,8 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                     )
                 elif parsed.path == "/api/discovery/scan":
                     self._json(self.app.discovery.state())
+                elif parsed.path == "/api/alert-rules":
+                    self._json(self.app.alert_rules())
                 elif parsed.path == "/api/alerts":
                     dashboard = self.app.dashboard()
                     self._json(
@@ -637,6 +686,9 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/nodes":
                 self._create_node(user)
+                return
+            if path == "/api/model/services/action":
+                self._model_service_action(user)
                 return
             if path == "/api/nodes/bulk":
                 self._bulk_add_nodes(user)
@@ -790,6 +842,26 @@ class SparkGridHandler(BaseHTTPRequestHandler):
             if not self._check_csrf(session):
                 return
             path = urllib.parse.urlparse(self.path).path
+            if path == "/api/alert-rules":
+                payload = self._read_json()
+                rules = payload.get("rules")
+                if not isinstance(rules, dict) or not rules:
+                    raise ValueError("没有可保存的告警规则")
+                allowed = {key for key, *_ in ALERT_RULES}
+                unknown = sorted(set(rules) - allowed)
+                if unknown:
+                    raise ValueError(f"未知告警规则: {', '.join(unknown)}")
+                self.app.config.update(rules)
+                self.app.notify_config_changed()
+                self.app.db.add_audit(
+                    user,
+                    "alert-rules.update",
+                    "runtime",
+                    json.dumps(rules, ensure_ascii=False),
+                    self.client_address[0],
+                )
+                self._json(self.app.alert_rules())
+                return
             if path == "/api/settings":
                 payload = self._read_json()
                 updated = self.app.config.update(payload)
@@ -954,6 +1026,23 @@ class SparkGridHandler(BaseHTTPRequestHandler):
         if not valid:
             self._error(403, "CSRF 校验失败")
         return valid
+
+    def _model_service_action(self, user: dict[str, Any] | None) -> None:
+        payload = self._read_json()
+        unit = str(payload.get("unit") or "").strip()
+        action = str(payload.get("action") or "").strip().lower()
+        if action not in ("start", "stop", "switch"):
+            self._error(400, "未知操作")
+            return
+        try:
+            result = self.app.model_control.submit(
+                action, unit, user, self.client_address[0]
+            )
+        except ModelControlError as exc:
+            message = str(exc)
+            self._error(409 if "进行中" in message else 400, message)
+            return
+        self._json(result)
 
     def _create_node(self, user: dict[str, Any]) -> None:
         config = self.app.config.current()

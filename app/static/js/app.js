@@ -8,6 +8,7 @@
     setupRequired: false,
     authMode: "login",
     dashboard: null,
+    alertRules: null,
     discovery: null,
     audit: [],
     settings: null,
@@ -22,6 +23,10 @@
       password_supported: false,
     },
     modelOverview: null,
+    modelServices: null,
+    modelServicesLoading: false,
+    modelServiceBusy: false,
+    modelTaskTimer: null,
     modelLogs: [],
     modelRank: "0",
     modelLogSearch: "",
@@ -598,6 +603,7 @@
         if (state.view === "audit") await loadAudit(true);
         if (state.view === "model") {
           await loadModelOverview(true);
+          await loadModelServices(true);
           const logRefresh =
             Math.max(
               2,
@@ -667,9 +673,12 @@
     if (!summary) return;
     $("#sideOnline").textContent = `${summary.online} / ${summary.total}`;
     $("#lastUpdate").textContent = `同步于 ${formatClock(state.dashboard.generated_at)}`;
-    const count = state.dashboard.alerts?.length || 0;
-    $("#alertNavCount").hidden = count === 0;
-    $("#alertNavCount").textContent = String(count);
+    const alertBadge = $("#alertNavCount");
+    if (alertBadge) {
+      const count = state.dashboard.alerts?.length || 0;
+      alertBadge.hidden = count === 0;
+      alertBadge.textContent = String(count);
+    }
     $$(".cluster-mini span").forEach((dot, index) => {
       dot.style.background =
         index < summary.online && index < Math.max(summary.total, 1) ? "var(--green)" : "#59615d";
@@ -690,9 +699,11 @@
     renderCurrentView();
     if (loadData) {
       if (view === "discovery") loadDiscovery();
+      if (view === "alerts") loadAlertRules();
       if (view === "audit") loadAudit();
       if (view === "model") {
         loadModelOverview();
+        loadModelServices();
         loadModelLogs();
       }
     }
@@ -741,11 +752,139 @@
     `;
   }
 
-  function pageHead(title, subtitle, actions = "") {
+  const HELP_TOPICS = {
+    overview: {
+      title: "集群总览说明",
+      html: `<p>总览页由中心端通过 SSH 主动拉取节点指标：<strong>无常驻 Agent</strong>，节点也不需要额外开放监控端口。</p>
+        <ul>
+          <li><strong>在线判定</strong>：连续采集失败达到阈值即标记离线，恢复后自动转回在线。</li>
+          <li><strong>指标口径</strong>：CPU / 内存 / GPU 均取自节点本地采样；GPU 默认使用驱动利用率，个别型号驱动值不可信时可改用功耗估算。</li>
+          <li><strong>采样间隔</strong>：可在系统设置中调整，页面标题处显示当前间隔，右上角显示最近同步时间。</li>
+        </ul>`,
+    },
+    nodes: {
+      title: "节点管理说明",
+      html: `<p>节点管理维护被监控资产清单，是采集、告警和模型监控的基础。</p>
+        <ul>
+          <li><strong>SSH 凭据</strong>（私钥或密码）加密保存在中心端，仅用于采集时登录节点。</li>
+          <li><strong>分组与标签</strong>用于总览筛选和批量操作。</li>
+          <li><strong>健康状态</strong>取决于最近一次 SSH 采集结果，可手动刷新或测试连接。</li>
+        </ul>`,
+    },
+    discovery: {
+      title: "局域网发现说明",
+      html: `<p>发现功能基于中心节点所在网卡扫描 IPv4 网段，再逐个探测 SSH 端口与主机身份。</p>
+        <ul>
+          <li><strong>只发现不纳管</strong>：勾选并导入后才会进入节点列表。</li>
+          <li><strong>只读探测</strong>：扫描不修改目标主机，仅做端口与身份识别。</li>
+          <li>支持选择网卡自动取网段，或手动填写多个 CIDR。</li>
+        </ul>`,
+    },
+    alerts: {
+      title: "告警中心说明",
+      html: `<p>告警由中心端按阈值规则生成，覆盖 CPU、GPU、内存、温度、离线与心跳。</p>
+        <ul>
+          <li><strong>分级</strong>：按超出阈值的幅度分为严重 / 警告两级。</li>
+          <li><strong>阈值</strong>：可在系统设置中调整，保存后下一轮采集生效。</li>
+          <li>本页只展示当前活动告警，历史操作记录见"操作审计"。</li>
+        </ul>`,
+    },
+    "alert-rules": {
+      title: "告警规则说明",
+      html: `<p>这里展示当前生效的全部告警阈值，可直接修改并保存，无需进入系统设置。</p>
+        <ul>
+          <li><strong>CPU / 内存 / GPU</strong>：指标达到阈值即产生"警告"级告警。</li>
+          <li><strong>温度</strong>：达到阈值产生"严重"级告警。</li>
+          <li><strong>离线判定</strong>：最后采集时间超过该秒数即判定节点离线，产生严重告警。</li>
+          <li>保存后下一轮采集立即生效；与"系统设置 → 告警阈值"是同一份配置，两处修改互相同步。</li>
+        </ul>
+        <p class="model-help-note">阈值过松会漏报，过紧会产生噪音；建议按集群日常负载留 10-15% 余量。</p>`,
+    },
+    audit: {
+      title: "操作审计说明",
+      html: `<p>记录管理员在平台上的关键操作：登录、节点增删改、批量纳管、扫描、设置变更、模型服务启停与切换。</p>
+        <ul>
+          <li>每条记录包含<strong>操作人、目标、时间与来源 IP</strong>。</li>
+          <li>只读展示，不支持在页面内修改或删除。</li>
+        </ul>`,
+    },
+    settings: {
+      title: "系统设置说明",
+      html: `<p>设置保存后立即写入，采集类参数在下一轮采样时应用。</p>
+        <ul>
+          <li><strong>GPU 查询命令</strong>留空时不做 GPU 采样（适用于无 GPU 或无需 GPU 监控的集群）。</li>
+          <li><strong>SSH 设置</strong>影响后续所有连接，包括端口、超时与已知主机校验策略。</li>
+          <li>修改前建议确认当前采集状态，避免误改导致节点集体离线。</li>
+        </ul>`,
+    },
+    "model-overview": {
+      title: "推理服务运行态说明",
+      html: `<p>本页展示正在运行的模型服务的<strong>容器级运行态</strong>，引擎（vLLM / SGLang）自动识别。</p>
+        <ul>
+          <li>指标来自容器进程参数、推理服务 <code>/metrics</code> 与运行日志解析。</li>
+          <li><strong>启动时间</strong>取容器 StartedAt；累计请求 / token 为引擎启动后的计数。</li>
+          <li><strong>节点健康</strong>为逐节点容器状态 + <code>/health</code> 探测结果。</li>
+        </ul>`,
+    },
+    "model-services": {
+      title: "模型服务识别与启停说明",
+      html: `<p>Spark Grid 会自动扫描 HEAD 节点上 systemd 中名为 <code>model_*.service</code> 的服务单元，把它们识别为可管理的模型服务，不需要在页面里逐条登记。</p>
+        <ul>
+          <li><strong>启动 / 停止</strong>：通过 <code>systemctl start / stop</code> 执行，与在服务器上手工操作完全一致；模型服务为 <code>Type=oneshot</code>，命令会等待启动脚本跑完。</li>
+          <li><strong>切换到此</strong>：先停掉其他正在运行的模型服务，以及可能把旧模型重新拉起的 guard 单元，再启动目标服务；完成后自动恢复与该模型对应的 guard。</li>
+          <li><strong>后台执行</strong>：8 节点启动通常需要数分钟（最长可达 70 分钟），任务在后台运行，本面板每 4 秒自动刷新进度；同一时间只允许一个任务。</li>
+          <li><strong>可审计</strong>：每次启停 / 切换都会写入"操作审计"，包含操作人与目标服务。</li>
+        </ul>
+        <p class="model-help-note">服务状态直接读取 systemd（active / inactive / activating 等），可与顶部"推理服务运行态"的容器级监控相互印证。</p>`,
+    },
+    "model-params": {
+      title: "关键启动参数说明",
+      html: `<p>参数从 HEAD 节点容器进程命令行解析（<code>--key value</code> 形式），只展示常用项。</p>
+        <ul>
+          <li>显示 <strong>—</strong> 表示当前启动命令未显式携带该参数，使用引擎默认值。</li>
+          <li>修改参数需要重启模型服务，可在"模型服务控制"面板启动 / 停止 / 切换。</li>
+        </ul>`,
+    },
+    "model-cluster": {
+      title: "集群状态说明",
+      html: `<p>与总览页同源，按当前模型所在节点的实时采样汇总。</p>
+        <ul>
+          <li><strong>GPU 负载</strong>为驱动利用率，<strong>统一内存</strong>为 GB10 统一内存占用。</li>
+          <li><strong>网络吞吐</strong>为节点网卡收发速率合计。</li>
+        </ul>`,
+    },
+    "model-logs": {
+      title: "模型日志说明",
+      html: `<p>日志来自当前模型容器的输出（docker logs）。</p>
+        <ul>
+          <li>可切换 <strong>rank</strong> 查看对应节点，默认 rank0（HEAD）。</li>
+          <li>支持关键词筛选与下载，行数上限可在系统设置中调整。</li>
+        </ul>`,
+    },
+  };
+
+  function helpButton(key) {
+    if (!HELP_TOPICS[key]) return "";
+    return `<button class="model-help-btn" data-action="open-help" data-help="${escapeHtml(key)}" title="说明" aria-label="说明">?</button>`;
+  }
+
+  function openHelp(key) {
+    const topic = HELP_TOPICS[key];
+    if (!topic) return;
+    openModal(`
+      <div class="modal model-help-modal">
+        <div class="modal-head"><h3>${escapeHtml(topic.title)}</h3><button class="icon-button subtle" data-action="close-modal" title="关闭" aria-label="关闭">${icon("x")}</button></div>
+        <div class="modal-body model-help-body">${topic.html}</div>
+        <div class="modal-foot"><button class="button secondary" data-action="close-modal">知道了</button></div>
+      </div>
+    `);
+  }
+
+  function pageHead(title, subtitle, actions = "", helpKey = "") {
     return `
       <div class="page-head">
         <div class="page-head-copy">
-          <h2>${escapeHtml(title)}</h2>
+          <h2>${escapeHtml(title)}${helpKey ? ` ${helpButton(helpKey)}` : ""}</h2>
           <p>${escapeHtml(subtitle)}</p>
         </div>
         <div class="page-actions">${actions}</div>
@@ -877,7 +1016,7 @@
           .join("")
       : emptyState("server-off", "还没有纳管节点", "扫描局域网 SSH 资产，或直接批量导入节点地址。", "开始扫描", "scan-network");
     $("#content").innerHTML = `
-      ${pageHead("实时节点状态", `采样间隔 ${state.dashboard.poll_interval} 秒`, actions)}
+      ${pageHead("实时节点状态", `采样间隔 ${state.dashboard.poll_interval} 秒`, actions, "overview")}
       <div class="overview-summary">
         ${summaryCards.map((card) => summaryCard(card.key, card.label, card.icon, card.value, card.unit, card.percent, card.tone, card.detail)).join("")}
       </div>
@@ -1493,7 +1632,7 @@
       <button class="primary-button compact" data-action="open-bulk-add">${icon("plus")}<span>添加节点</span></button>
     `;
     $("#content").innerHTML = `
-      ${pageHead("资产与批量操作", `${nodes.length} 个节点 · ${nodes.filter((node) => node.status === "online").length} 个在线`, actions)}
+      ${pageHead("资产与批量操作", `${nodes.length} 个节点 · ${nodes.filter((node) => node.status === "online").length} 个在线`, actions, "nodes")}
       <div class="toolbar">
         <div class="search-box">${icon("search")}<input id="nodeSearch" value="${escapeHtml(state.filters.search)}" placeholder="搜索名称、IP、标签"></div>
         <select class="select" id="groupFilter">
@@ -1638,7 +1777,7 @@
       `
       : emptyState("radar", "还没有发现节点", "选择本机网卡后扫描对应 IPv4 网段。", "立即扫描", "scan-network-inline");
     $("#content").innerHTML = `
-      ${pageHead("自动发现与批量纳管", `${items.length} 个发现结果`, `<button class="button secondary compact" data-action="refresh-discovery">${icon("refresh-cw")}<span>刷新</span></button>`)}
+      ${pageHead("自动发现与批量纳管", `${items.length} 个发现结果`, `<button class="button secondary compact" data-action="refresh-discovery">${icon("refresh-cw")}<span>刷新</span></button>`, "discovery")}
       <div class="scan-panel">
         <div class="scan-main">
           <div class="scan-title">${icon(scan.scanning ? "loader-circle" : "radar")}<span>${scanLabel}</span></div>
@@ -1685,14 +1824,113 @@
       ? alerts.map(renderAlertRow).join("")
       : emptyState("shield-check", "当前没有告警", "所有在线节点均在设定阈值内。");
     $("#content").innerHTML = `
-      ${pageHead("集群告警", `${alerts.length} 个活动告警`)}
+      ${pageHead("集群告警", `${alerts.length} 个活动告警`, "", "alerts")}
       <div class="alert-summary">
         <div class="alert-stat"><div class="alert-stat-icon critical">${icon("octagon-alert")}</div><div><strong data-alert-stat="critical">${critical}</strong><span>严重告警</span></div></div>
         <div class="alert-stat"><div class="alert-stat-icon warning">${icon("triangle-alert")}</div><div><strong data-alert-stat="warning">${warning}</strong><span>性能警告</span></div></div>
         <div class="alert-stat"><div class="alert-stat-icon">${icon("check-circle-2")}</div><div><strong data-alert-stat="healthy">${Math.max(0, (state.dashboard?.summary.total || 0) - new Set(alerts.map((alert) => alert.node_id)).size)}</strong><span>健康节点</span></div></div>
       </div>
+      ${renderAlertRulesPanel()}
       <div class="alert-list" id="alertList">${list}</div>
     `;
+  }
+
+  function renderAlertRulesPanel() {
+    const rules = state.alertRules?.rules || [];
+    if (!rules.length) return "";
+    const rows = rules
+      .map(
+        (rule) => `
+        <div class="alert-rule-row" data-rule-key="${escapeHtml(rule.key)}">
+          <span class="severity ${rule.severity}">${rule.severity === "critical" ? "严重" : "警告"}</span>
+          <div class="alert-rule-copy">
+            <strong>${escapeHtml(rule.display)}</strong>
+            <small>${escapeHtml(rule.description)}</small>
+          </div>
+          <div class="alert-rule-input">
+            <input type="number" class="text-input" data-rule-input="${escapeHtml(rule.key)}" value="${escapeHtml(rule.value)}" min="${escapeHtml(rule.min)}" max="${escapeHtml(rule.max)}" step="1" aria-label="${escapeHtml(rule.label)}">
+            <em>${escapeHtml(rule.unit)}</em>
+          </div>
+          <span class="alert-rule-triggered ${rule.triggered ? "hit" : ""}" data-rule-triggered="${escapeHtml(rule.key)}">${rule.triggered ? `${rule.triggered} 个节点触发` : "未触发"}</span>
+        </div>`,
+      )
+      .join("");
+    return `
+      <section class="alert-rules-panel">
+        <div class="alert-rules-head">
+          <h3>告警规则 ${helpButton("alert-rules")}</h3>
+          <div class="alert-rules-actions">
+            <button class="button ghost compact" data-action="alert-rules-reset">${icon("rotate-ccw")}<span>恢复默认</span></button>
+            <button class="button secondary compact" data-action="alert-rules-save">${icon("save")}<span>保存规则</span></button>
+          </div>
+        </div>
+        <div class="alert-rule-list">${rows}</div>
+      </section>
+    `;
+  }
+
+  async function loadAlertRules() {
+    try {
+      const payload = await api("/api/alert-rules");
+      state.alertRules = payload;
+      if (state.view === "alerts") renderAlerts();
+    } catch (error) {
+      if (error.status !== 401) showToast(error.message, "error");
+    }
+  }
+
+  function collectAlertRules() {
+    const rules = {};
+    for (const input of $$("[data-rule-input]")) {
+      const value = Number(input.value);
+      if (!Number.isFinite(value)) return null;
+      rules[input.dataset.ruleInput] = value;
+    }
+    return Object.keys(rules).length ? rules : null;
+  }
+
+  async function saveAlertRules() {
+    const rules = collectAlertRules();
+    if (!rules) {
+      showToast("阈值必须是有效数字", "error");
+      return;
+    }
+    try {
+      state.alertRules = await api("/api/alert-rules", { method: "PATCH", body: { rules } });
+      renderAlerts();
+      refreshIcons($("#content"));
+      showToast("告警规则已保存，下一轮采集生效", "success");
+      await loadDashboard(true);
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  function resetAlertRules() {
+    const rules = state.alertRules?.rules || [];
+    if (!rules.length) return;
+    confirmDialog(
+      "恢复默认告警规则",
+      "将把 CPU、内存、GPU、温度和离线判定恢复为默认阈值。",
+      "恢复默认",
+      async () => {
+        const defaults = {};
+        for (const rule of rules) defaults[rule.key] = rule.default;
+        try {
+          state.alertRules = await api("/api/alert-rules", {
+            method: "PATCH",
+            body: { rules: defaults },
+          });
+          renderAlerts();
+          refreshIcons($("#content"));
+          showToast("已恢复默认告警规则", "success");
+          await loadDashboard(true);
+        } catch (error) {
+          showToast(error.message, "error");
+        }
+      },
+      false,
+    );
   }
 
   function renderAlertRow(alert) {
@@ -1737,7 +1975,7 @@
           .join("")
       : emptyState("scroll-text", "还没有操作记录", "登录、纳管和批量操作会记录在这里。");
     $("#content").innerHTML = `
-      ${pageHead("管理员操作记录", `${state.audit.length} 条最近记录`, `<button class="button secondary compact" data-action="export-audit">${icon("download")}<span>导出视图</span></button>`)}
+      ${pageHead("管理员操作记录", `${state.audit.length} 条最近记录`, `<button class="button secondary compact" data-action="export-audit">${icon("download")}<span>导出视图</span></button>`, "audit")}
       <div class="audit-list">${rows}</div>
     `;
   }
@@ -2105,6 +2343,159 @@
     ];
   }
 
+  function modelServiceStateInfo(service) {
+    const active = String(service.active_state || "");
+    if (active === "active") return { key: "active", label: "运行中", cls: "active" };
+    if (active === "activating" || active === "reloading") return { key: "starting", label: "启动中", cls: "starting" };
+    if (active === "deactivating") return { key: "stopping", label: "停止中", cls: "stopping" };
+    if (active === "failed") return { key: "failed", label: "失败", cls: "failed" };
+    return { key: "inactive", label: "已停止", cls: "inactive" };
+  }
+
+  function modelServiceTaskHtml(task) {
+    if (!task) return "";
+    const actionLabel = { start: "启动", stop: "停止", switch: "切换" }[task.action] || task.action;
+    const statusIcon = task.status === "running" ? icon("loader-circle", "spin") : task.status === "done" ? icon("check") : icon("alert-triangle");
+    return `
+      <div class="model-service-task ${escapeHtml(task.status)}">
+        <span class="model-service-task-icon">${statusIcon}</span>
+        <div class="model-service-task-copy">
+          <strong>${escapeHtml(actionLabel)} · ${escapeHtml(task.unit || "")}</strong>
+          <small>${escapeHtml(task.message || "")}</small>
+        </div>
+      </div>`;
+  }
+
+  function modelServicesPanelHtml() {
+    const data = state.modelServices;
+    if (!data) {
+      return `
+        <div class="model-panel-head"><h3>模型服务控制 <small>MODEL SERVICES · HEAD</small></h3><span>读取中</span></div>
+        <div class="model-service-loading">${icon("loader-circle", "spin")}<span>正在读取 HEAD 节点上的 model_* 服务</span></div>`;
+    }
+    const head = data.head?.name || data.head?.host || "HEAD";
+    const header = `<div class="model-panel-head"><h3>模型服务控制 <small>MODEL SERVICES · HEAD</small>${helpButton("model-services")}</h3><span>${escapeHtml(head)} · ${(data.services || []).length} 个服务</span></div>`;
+    if (data.available === false) {
+      return `${header}<div class="model-service-error">${icon("alert-triangle")}<span>${escapeHtml(data.error || "HEAD 节点不可达，无法读取模型服务")}</span></div>`;
+    }
+    const services = data.services || [];
+    const busy = Boolean(data.task && data.task.status === "running");
+    if (!services.length) {
+      return `${header}<div class="model-service-empty">未发现 model_*.service，请确认 HEAD 节点已配置模型服务单元</div>`;
+    }
+    const rows = services
+      .map((service) => {
+        const info = modelServiceStateInfo(service);
+        const running = ["active", "activating", "reloading", "deactivating"].includes(String(service.active_state));
+        const unit = escapeHtml(service.unit);
+        return `
+          <div class="model-service-row ${info.cls}">
+            <span class="model-service-dot ${info.cls}"></span>
+            <div class="model-service-copy">
+              <strong>${escapeHtml(service.name || service.unit)}</strong>
+              <small>${escapeHtml(service.description || service.unit)}</small>
+            </div>
+            <em class="model-service-state ${info.cls}">${info.label}<i>${escapeHtml(service.active_state || "unknown")}/${escapeHtml(service.sub_state || "unknown")}</i></em>
+            <div class="model-service-actions">
+              <button class="button ghost compact" data-action="model-service-start" data-unit="${unit}" ${busy || running ? "disabled" : ""}>${icon("play")}<span>启动</span></button>
+              <button class="button ghost compact danger" data-action="model-service-stop" data-unit="${unit}" ${busy || !running ? "disabled" : ""}>${icon("square")}<span>停止</span></button>
+              <button class="button secondary compact" data-action="model-service-switch" data-unit="${unit}" ${busy || running ? "disabled" : ""}>${icon("repeat")}<span>切换到此</span></button>
+            </div>
+          </div>`;
+      })
+      .join("");
+    return `${header}${modelServiceTaskHtml(data.task)}<div class="model-service-list">${rows}</div>
+      <div class="model-service-hint">启动 / 停止 / 切换均在后台执行（8 节点 oneshot，通常数分钟），任务进度会自动刷新。</div>`;
+  }
+
+  function renderModelServicesPanel() {
+    const section = $("#modelServicePanel");
+    if (!section) return;
+    section.innerHTML = modelServicesPanelHtml();
+    refreshIcons(section);
+  }
+
+  async function loadModelServices(silent = false) {
+    if (state.modelServicesLoading) return state.modelServices;
+    state.modelServicesLoading = true;
+    try {
+      const data = await api("/api/model/services");
+      state.modelServices = data;
+      if (data?.task?.status === "running") startModelTaskPolling();
+      if (state.view === "model") {
+        if (!silent || !$("#modelServicePanel") || !$(".model-status-band")) renderModel();
+        else renderModelServicesPanel();
+      }
+      return data;
+    } catch (error) {
+      if (error.status !== 401) showToast(error.message, "error");
+      return null;
+    } finally {
+      state.modelServicesLoading = false;
+    }
+  }
+
+  function startModelTaskPolling() {
+    if (state.modelTaskTimer) return;
+    state.modelTaskTimer = setInterval(async () => {
+      const data = await loadModelServices(true);
+      const task = data?.task;
+      if (!task || task.status !== "running") {
+        clearInterval(state.modelTaskTimer);
+        state.modelTaskTimer = null;
+        await loadModelServices(true);
+        if (task) {
+          showToast(
+            task.status === "failed" ? `任务失败：${task.message}` : `任务完成：${task.unit}`,
+            task.status === "failed" ? "error" : "success",
+          );
+        }
+      }
+    }, 4000);
+  }
+
+  function askModelServiceAction(action, unit) {
+    const info = (state.modelServices?.services || []).find((item) => item.unit === unit);
+    const label = { start: "启动", stop: "停止", switch: "切换" }[action] || action;
+    const name = info?.name || unit;
+    if (action === "switch") {
+      confirmDialog(
+        "切换模型服务",
+        `将停止其他运行中的模型服务并启动 ${name}。8 节点启动通常需要数分钟，期间推理服务不可用。确认切换？`,
+        "确认切换",
+        () => runModelServiceAction(action, unit),
+        true,
+      );
+    } else {
+      confirmDialog(
+        `${label}模型服务`,
+        `${label} ${name}？${action === "stop" ? "停止后推理服务将不可用。" : ""}`,
+        `确认${label}`,
+        () => runModelServiceAction(action, unit),
+        action === "stop",
+      );
+    }
+  }
+
+  async function runModelServiceAction(action, unit) {
+    if (state.modelServiceBusy) return;
+    state.modelServiceBusy = true;
+    try {
+      const result = await api("/api/model/services/action", {
+        method: "POST",
+        body: { action, unit },
+      });
+      state.modelServices = { ...(state.modelServices || {}), task: result.task };
+      renderModelServicesPanel();
+      startModelTaskPolling();
+      showToast(`任务已提交：${action === "start" ? "启动" : action === "stop" ? "停止" : "切换"} ${unit}`, "success");
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      state.modelServiceBusy = false;
+    }
+  }
+
   async function loadModelOverview(silent = false) {
     try {
       const data = await api("/api/model/overview");
@@ -2181,7 +2572,7 @@
     const data = state.modelOverview;
     if (!data) {
       $("#content").innerHTML = `
-        ${pageHead("推理服务运行态", "正在读取模型服务", `<button class="button secondary compact" data-action="model-refresh">${icon("refresh-cw")}<span>刷新</span></button>`)}
+        ${pageHead("推理服务运行态", "正在读取模型服务", `<button class="button secondary compact" data-action="model-refresh">${icon("refresh-cw")}<span>刷新</span></button>`, "model-overview")}
         <div class="panel"><div class="empty-state"><div class="empty-state-icon">${icon("loader-circle", "spin")}</div><strong>正在连接模型服务</strong></div></div>
       `;
       refreshIcons($("#content"));
@@ -2215,7 +2606,7 @@
       </div>
     `).join("");
     $("#content").innerHTML = `
-      ${pageHead("推理服务运行态", `模型管理 · ${fields.health}`, `<button class="button secondary compact" data-action="model-refresh">${icon("refresh-cw")}<span>刷新</span></button>`)}
+      ${pageHead("推理服务运行态", `模型管理 · ${fields.health}`, `<button class="button secondary compact" data-action="model-refresh">${icon("refresh-cw")}<span>刷新</span></button>`, "model-overview")}
       <section class="model-status-band">
         <div class="model-identity">
           <div class="model-status-icon ${statusClass}">${icon("brain-circuit")}</div>
@@ -2249,8 +2640,9 @@
       </section>
       <div class="model-kpi-grid">${kpiHtml}</div>
       <div class="model-dashboard-grid">
+        <section class="model-panel model-service-panel" id="modelServicePanel">${modelServicesPanelHtml()}</section>
         <section class="model-panel">
-          <div class="model-panel-head"><h3>关键启动参数 <small>KEY STARTUP PARAMETERS</small></h3><span>HEAD / RANK 0</span></div>
+          <div class="model-panel-head"><h3>关键启动参数 <small>KEY STARTUP PARAMETERS</small>${helpButton("model-params")}</h3><span>HEAD / RANK 0</span></div>
           <div class="model-compact-list">
             <div class="model-param-row"><div><code>--kv-cache-memory-bytes</code><small>KV Cache memory allocation · KV 缓存显存分配</small></div><strong data-model-field="kv-cache-memory">${escapeHtml(fields["kv-cache-memory"])}</strong></div>
             <div class="model-param-row"><div><code>--gpu-memory-utilization</code><small>GPU memory usage ceiling · GPU 显存占用上限</small></div><strong data-model-field="gpu-memory-utilization">${escapeHtml(fields["gpu-memory-utilization"])}</strong></div>
@@ -2261,7 +2653,7 @@
           </div>
         </section>
         <section class="model-panel">
-          <div class="model-panel-head"><h3>集群状态 <small>CLUSTER STATUS</small></h3><span>${nodes.length} NODE</span></div>
+          <div class="model-panel-head"><h3>集群状态 <small>CLUSTER STATUS</small>${helpButton("model-cluster")}</h3><span>${nodes.length} NODE</span></div>
           <div class="model-compact-list">
             <div class="model-compact-row"><span>节点健康</span><strong data-model-field="health">${escapeHtml(fields.health)}</strong></div>
             <div class="model-compact-row"><span>服务状态</span><strong data-model-field="status">${escapeHtml(fields.status)}</strong></div>
@@ -2272,7 +2664,6 @@
           </div>
         </section>
         <section class="model-panel model-throughput-panel">
-          <div class="model-panel-head"><h3>${escapeHtml(formatHistoryRange(modelHistoryMinutes))}曲线 <small>P/D TIME SERIES</small></h3><span>${escapeHtml(formatPointInterval(modelPointInterval))}</span></div>
           <div class="model-throughput-bars">
             ${throughputCharts.map((item) => `
               <div class="model-throughput-item" data-model-throughput="${item.key}">
@@ -2307,7 +2698,7 @@
       </div>
       <section class="model-log-panel">
         <div class="model-log-toolbar">
-          <div class="model-log-title">${icon("terminal")}<span>模型运行日志</span></div>
+          <div class="model-log-title">${icon("terminal")}<span>模型运行日志</span>${helpButton("model-logs")}</div>
           <div class="model-log-actions">
             <select class="select" id="modelLogRank">${rankOptions}</select>
             <input class="text-input" id="modelLogSearch" value="${escapeHtml(state.modelLogSearch)}" placeholder="筛选日志">
@@ -2443,6 +2834,7 @@
         "系统设置",
         "所有运行参数均由当前页面管理，保存后自动应用到后续采集和刷新。",
         `<button class="button secondary compact" type="submit" form="settingsForm">${icon("save")}<span>保存设置</span></button>`,
+        "settings",
       )}
       <form id="settingsForm" class="settings-layout">
         <div class="settings-groups">${groupHtml}</div>
@@ -3134,6 +3526,18 @@
           await loadModelLogs();
         } else if (action === "model-log-download") {
           downloadModelLogs();
+        } else if (action === "model-service-start") {
+          askModelServiceAction("start", actionElement.dataset.unit);
+        } else if (action === "model-service-stop") {
+          askModelServiceAction("stop", actionElement.dataset.unit);
+        } else if (action === "model-service-switch") {
+          askModelServiceAction("switch", actionElement.dataset.unit);
+        } else if (action === "open-help") {
+          openHelp(actionElement.dataset.help);
+        } else if (action === "alert-rules-save") {
+          await saveAlertRules();
+        } else if (action === "alert-rules-reset") {
+          resetAlertRules();
         }
         return;
       }

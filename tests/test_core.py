@@ -1193,5 +1193,88 @@ class HttpIntegrationTests(unittest.TestCase):
         self.assertNotIn("ssh_password", serialized)
 
 
+class ModelControlParsingTests(unittest.TestCase):
+    """Parsing and validation for HEAD model_* service control."""
+
+    def setUp(self):
+        from app.model_control import ModelControl
+
+        self.control = ModelControl.__new__(ModelControl)
+
+    def test_parse_units(self):
+        raw = (
+            "UNIT:model_a.service\n"
+            "ActiveState=active\nSubState=running\n"
+            "UnitFileState=enabled\nDescription=A model\nEND_UNIT\n"
+            "UNIT:model_b.service\n"
+            "ActiveState=inactive\nSubState=dead\n"
+            "UnitFileState=disabled\nDescription=B model\nEND_UNIT\n"
+        )
+        units = self.control._parse_units(raw)
+        self.assertEqual(
+            [unit["unit"] for unit in units],
+            ["model_a.service", "model_b.service"],
+        )
+        self.assertTrue(units[0]["active"])
+        self.assertFalse(units[1]["active"])
+        self.assertEqual(units[0]["description"], "A model")
+        self.assertEqual(units[0]["name"], "model_a")
+
+    def test_parse_units_empty(self):
+        self.assertEqual(self.control._parse_units("NO_UNITS"), [])
+
+    def test_parse_guards_keeps_every_entry(self):
+        # The remote script emits END_GUARD so consecutive records never merge.
+        raw = (
+            "GUARD:model-glm53-guard.service\nActiveState=active\nSubState=running\nEND_GUARD\n"
+            "GUARD:spark-ds41f-guard.service\nActiveState=inactive\nSubState=dead\nEND_GUARD\n"
+        )
+        guards = self.control._parse_guards(raw)
+        self.assertEqual(
+            [guard["unit"] for guard in guards],
+            ["model-glm53-guard.service", "spark-ds41f-guard.service"],
+        )
+        self.assertEqual(guards[0]["active_state"], "active")
+
+    def test_parse_guards_without_end_marker(self):
+        raw = "GUARD:model-glm53-guard.service\nActiveState=active\nSubState=running\nGUARD:spark-ds41f-guard.service\nActiveState=inactive\nSubState=dead\n"
+        guards = self.control._parse_guards(raw)
+        self.assertEqual(len(guards), 2)
+
+    def test_validate_unit_rejects_injection(self):
+        from app.model_control import ModelControlError
+
+        for bad in ("rm -rf /", "model_x.service; reboot", "../model_x.service", ""):
+            with self.assertRaises(ModelControlError):
+                self.control._validate_unit(bad)
+        self.assertEqual(
+            self.control._validate_unit("model_glm53.service"),
+            "model_glm53.service",
+        )
+
+    def test_related_guards_match_by_model_token(self):
+        guards = [
+            {"unit": "model-glm53-guard.service"},
+            {"unit": "spark-ds41f-guard.service"},
+        ]
+        self.assertEqual(
+            self.control._related_guards("model_glm53.service", guards),
+            ["model-glm53-guard.service"],
+        )
+
+    def test_related_guards_match_by_unit_dependency(self):
+        # v41f and ds41f-guard share no name token; the unit's Before= does.
+        guards = [
+            {"unit": "model-glm53-guard.service"},
+            {"unit": "spark-ds41f-guard.service"},
+        ]
+        self.assertEqual(
+            self.control._related_guards(
+                "model_v41f.service", guards, ["spark-ds41f-guard.service"]
+            ),
+            ["spark-ds41f-guard.service"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
