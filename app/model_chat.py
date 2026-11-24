@@ -19,6 +19,7 @@ from typing import Any
 
 from .ssh_runner import SSHError
 
+KEY_OVERRIDE_SETTING = "model_api_key_override"
 KEY_TTL_SECONDS = 600.0
 CHAT_TIMEOUT_SECONDS = 300.0
 MAX_MESSAGES = 60
@@ -88,12 +89,30 @@ class ModelChat:
         )
         return [line.strip() for line in output.splitlines() if line.strip()]
 
+    def _override_key(self) -> str:
+        try:
+            raw = (self.db.get_settings() or {}).get(KEY_OVERRIDE_SETTING)
+        except Exception:  # noqa: BLE001 - settings must not break chat
+            return ""
+        if not raw:
+            return ""
+        try:
+            return self.db.credential_cipher.decrypt(str(raw))
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _api_key(self) -> str:
+        override = self._override_key()
+        if override:
+            return override
         now = time.time()
         with self._lock:
             cached_at, cached_key = self._key_cache
             if cached_key and now - cached_at < KEY_TTL_SECONDS:
                 return cached_key
+        return self._read_container_key()
+
+    def _read_container_key(self) -> str:
         containers = self._running_containers()
         if not containers:
             raise ChatError("HEAD 节点上没有运行中的模型容器")
@@ -169,6 +188,66 @@ class ModelChat:
             raise ChatError(f"无法连接模型服务 {host}:{port}（{exc}）") from exc
 
     # ------------------------------------------------------------- public API
+
+    def key_info(self) -> dict[str, Any]:
+        override = self._override_key()
+        container_key = ""
+        try:
+            container_key = self._read_container_key()
+        except ChatError:
+            container_key = ""
+        effective = override or container_key
+        host, port = "", 0
+        models: list[str] = []
+        try:
+            host, port = self._endpoint()
+            models = self.info().get("models", [])
+        except ChatError:
+            pass
+        model = models[0] if models else ""
+        endpoint = f"http://{host}:{port}" if host else ""
+        curl = ""
+        if endpoint:
+            body = (
+                '{"model": "%s", "messages": [{"role": "user", "content": "你好"}], '
+                '"stream": true}' % model
+            )
+            curl = (
+                f"curl -s {endpoint}/v1/chat/completions \\\n"
+                f'  -H "Content-Type: application/json" \\\n'
+                f'  -H "Authorization: Bearer {effective}" \\\n'
+                f"  -d '{body}'"
+            )
+        return {
+            "key": effective,
+            "has_key": bool(effective),
+            "source": "override" if override else ("container" if container_key else ""),
+            "override": bool(override),
+            "container_key": container_key,
+            "endpoint": endpoint,
+            "model": model,
+            "models": models,
+            "curl": curl,
+        }
+
+    def set_key(self, key: str) -> dict[str, Any]:
+        value = str(key or "").strip()
+        if len(value) < 8:
+            raise ChatError("Key 至少需要 8 个字符")
+        if len(value) > 256:
+            raise ChatError("Key 过长（最多 256 字符）")
+        self.db.update_settings(
+            {KEY_OVERRIDE_SETTING: self.db.credential_cipher.encrypt(value)}
+        )
+        with self._lock:
+            self._key_cache = (0.0, "")
+        return self.key_info()
+
+    def clear_key(self) -> dict[str, Any]:
+        self.db.update_settings({KEY_OVERRIDE_SETTING: ""})
+        with self._lock:
+            self._key_cache = (0.0, "")
+        return self.key_info()
 
     def info(self) -> dict[str, Any]:
         host, port = "", 0

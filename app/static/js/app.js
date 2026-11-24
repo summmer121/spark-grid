@@ -10,6 +10,8 @@
     dashboard: null,
     alertRules: null,
     chatInfo: null,
+    keyInfo: null,
+    keyVisible: false,
     chat: {
       messages: [],
       attachments: [],
@@ -62,7 +64,8 @@
   const viewMeta = {
     overview: { eyebrow: "CLUSTER OVERVIEW", title: "集群总览" },
     model: { eyebrow: "MODEL RUNTIME", title: "模型管理" },
-    chat: { eyebrow: "MODEL TEST", title: "模型测试" },
+    chat: { eyebrow: "CHAT TEST", title: "会话测试" },
+    keymgr: { eyebrow: "API KEY", title: "API Key 管理" },
     nodes: { eyebrow: "NODE INVENTORY", title: "节点管理" },
     discovery: { eyebrow: "LAN DISCOVERY", title: "局域网发现" },
     alerts: { eyebrow: "ALERT CENTER", title: "告警中心" },
@@ -694,7 +697,7 @@
     });
   }
 
-  const MODEL_VIEWS = new Set(["model", "chat"]);
+  const MODEL_VIEWS = new Set(["model", "chat", "keymgr"]);
 
   function navigate(view, loadData = true) {
     if (!viewMeta[view]) view = "overview";
@@ -719,6 +722,7 @@
       if (view === "discovery") loadDiscovery();
       if (view === "alerts") loadAlertRules();
       if (view === "chat") loadChatInfo();
+      if (view === "keymgr") loadKeyInfo();
       if (view === "audit") loadAudit();
       if (view === "model") {
         loadModelOverview();
@@ -753,6 +757,9 @@
         break;
       case "chat":
         renderChat();
+        break;
+      case "keymgr":
+        renderKeyManager();
         break;
       case "settings":
         renderSettings();
@@ -875,8 +882,17 @@
           <li><strong>网络吞吐</strong>为节点网卡收发速率合计。</li>
         </ul>`,
     },
+    "model-key": {
+      title: "API Key 管理说明",
+      html: `<p>这里显示模型服务当前生效的访问 Key，并生成可直接复制的 curl 示例。</p>
+        <ul>
+          <li><strong>来源</strong>：容器 secret 或容器环境变量中的服务端真实 Key。</li>
+          <li><strong>用途</strong>：页面提供 Key 查看、复制与 curl 示例，便于快速对接客户端。</li>
+          <li><strong>服务端换 Key</strong>：需要修改容器启动参数（<code>--api-key</code> 或 <code>VLLM_API_KEY</code>）并重启模型服务，会中断推理。</li>
+        </ul>`,
+    },
     chat: {
-      title: "模型测试说明",
+      title: "会话测试说明",
       html: `<p>通过 OpenAI 兼容接口直接和运行中的模型对话，用于验证服务可用性与生成性能。</p>
         <ul>
           <li><strong>输入 / 输出 Token</strong>：取自引擎返回的 usage（<code>stream_options.include_usage</code>）。</li>
@@ -2542,6 +2558,134 @@
     return parts;
   }
 
+  async function loadKeyInfo() {
+    try {
+      state.keyInfo = await api("/api/model/key");
+    } catch (error) {
+      if (error.status !== 401) showToast(error.message, "error");
+    }
+    if (state.view === "keymgr") renderKeyManager();
+  }
+
+  function maskKey(key) {
+    const value = String(key || "");
+    if (!value) return "—";
+    if (value.length <= 8) return "•".repeat(value.length);
+    return `${value.slice(0, 4)}${"•".repeat(Math.min(18, value.length - 8))}${value.slice(-4)}`;
+  }
+
+  async function copyText(text) {
+    const value = String(text || "");
+    if (!value) return false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch {
+      /* fall through to execCommand */
+    }
+    try {
+      const area = document.createElement("textarea");
+      area.value = value;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(area);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  function renderKeyManager() {
+    const info = state.keyInfo;
+    if (!info) {
+      $("#content").innerHTML = `
+        ${pageHead("API Key 管理", "正在读取当前 Key", "", "model-key")}
+        <div class="panel"><div class="empty-state"><div class="empty-state-icon">${icon("loader-circle", "spin")}</div><strong>正在读取</strong></div></div>`;
+      refreshIcons($("#content"));
+      return;
+    }
+    const sourceLabel =
+      info.source === "override"
+        ? "平台覆盖"
+        : info.source === "container"
+          ? "容器（服务端真实 Key）"
+          : "未找到";
+    const shown = state.keyVisible ? info.key || "—" : maskKey(info.key);
+    $("#content").innerHTML = `
+      ${pageHead(
+        "API Key 管理",
+        `来源：${sourceLabel}`,
+        `<button class="button secondary compact" data-action="key-refresh">${icon("refresh-cw")}<span>刷新</span></button>`,
+        "model-key",
+      )}
+      <section class="key-panel">
+        <div class="key-row">
+          <span class="key-label">当前 Key</span>
+          <div class="key-value">
+            <code>${escapeHtml(shown)}</code>
+            <button class="icon-button subtle" data-action="key-toggle-visible" title="${state.keyVisible ? "隐藏" : "显示"}" aria-label="显示或隐藏">${icon(state.keyVisible ? "eye-off" : "eye")}</button>
+            <button class="button ghost compact" data-action="key-copy">${icon("copy")}<span>复制</span></button>
+          </div>
+        </div>
+        <div class="key-row">
+          <span class="key-label">Endpoint</span>
+          <div class="key-value">
+            <code>${escapeHtml(info.endpoint || "—")}</code>
+            <button class="button ghost compact" data-action="key-copy-endpoint">${icon("copy")}<span>复制</span></button>
+          </div>
+        </div>
+        <div class="key-row">
+          <span class="key-label">模型</span>
+          <div class="key-value">
+            <code>${escapeHtml(info.model || "—")}</code>
+          </div>
+        </div>
+      </section>
+      <section class="key-panel">
+        <div class="key-panel-head">
+          <h3>curl 示例 <small>CURL EXAMPLE</small></h3>
+          <button class="button ghost compact" data-action="key-copy-curl">${icon("copy")}<span>复制命令</span></button>
+        </div>
+        <pre class="key-curl">${escapeHtml(info.curl || "（模型服务不可用，无法生成示例）")}</pre>
+      </section>
+      </section>`;
+    refreshIcons($("#content"));
+  }
+
+  async function saveModelKey() {
+    const value = ($("#keyInput")?.value || "").trim();
+    if (value.length < 8) {
+      showToast("Key 至少需要 8 个字符", "error");
+      return;
+    }
+    try {
+      state.keyInfo = await api("/api/model/key", { method: "PATCH", body: { key: value } });
+      state.keyVisible = false;
+      renderKeyManager();
+      showToast("平台 Key 覆盖已保存", "success");
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  function clearModelKey() {
+    confirmDialog("清除平台 Key 覆盖", "将恢复使用容器内的服务端 Key。", "清除", async () => {
+      try {
+        state.keyInfo = await api("/api/model/key", { method: "PATCH", body: { clear: true } });
+        state.keyVisible = false;
+        renderKeyManager();
+        showToast("已清除平台覆盖", "success");
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  }
+
   function renderChat() {
     const info = state.chatInfo;
     const models = info?.models || [];
@@ -2556,7 +2700,7 @@
     const aliasHint = aliasCount ? ` · 已合并 ${aliasCount} 个同模型别名` : "";
     $("#content").innerHTML = `
       ${pageHead(
-        "模型测试",
+        "会话测试",
         info ? (info.available ? `已连接 ${info.endpoint}` : "模型服务不可用") : "正在检测模型服务",
         `<button class="button ghost compact" data-action="chat-reset">${icon("rotate-ccw")}<span>新会话</span></button>`,
         "chat",
@@ -3943,6 +4087,24 @@
           openHelp(actionElement.dataset.help);
         } else if (action === "chat-send") {
           await sendChat();
+        } else if (action === "key-refresh") {
+          await loadKeyInfo();
+        } else if (action === "key-toggle-visible") {
+          state.keyVisible = !state.keyVisible;
+          renderKeyManager();
+        } else if (action === "key-copy") {
+          const ok = await copyText(state.keyInfo?.key || "");
+          showToast(ok ? "Key 已复制" : "复制失败，请手动选择", ok ? "success" : "error");
+        } else if (action === "key-copy-endpoint") {
+          const ok = await copyText(state.keyInfo?.endpoint || "");
+          showToast(ok ? "Endpoint 已复制" : "复制失败", ok ? "success" : "error");
+        } else if (action === "key-copy-curl") {
+          const ok = await copyText(state.keyInfo?.curl || "");
+          showToast(ok ? "curl 命令已复制" : "复制失败", ok ? "success" : "error");
+        } else if (action === "key-save") {
+          await saveModelKey();
+        } else if (action === "key-clear") {
+          clearModelKey();
         } else if (action === "chat-attach") {
           $("#chatFileInput")?.click();
         } else if (action === "chat-remove-attachment") {

@@ -572,6 +572,8 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                     self._json(self.app.model_control.list_services())
                 elif parsed.path == "/api/model/chat/info":
                     self._json(self.app.model_chat.info())
+                elif parsed.path == "/api/model/key":
+                    self._json(self.app.model_chat.key_info())
                 elif parsed.path == "/api/model/logs":
                     config = self.app.config.current()
                     query = urllib.parse.parse_qs(parsed.query)
@@ -852,6 +854,23 @@ class SparkGridHandler(BaseHTTPRequestHandler):
             if not self._check_csrf(session):
                 return
             path = urllib.parse.urlparse(self.path).path
+            if path == "/api/model/key":
+                payload = self._read_json()
+                try:
+                    if payload.get("clear"):
+                        result = self.app.model_chat.clear_key()
+                        detail = "清除平台 Key 覆盖"
+                    else:
+                        result = self.app.model_chat.set_key(str(payload.get("key") or ""))
+                        detail = "设置平台 Key 覆盖"
+                except ChatError as exc:
+                    self._error(400, str(exc))
+                    return
+                self.app.db.add_audit(
+                    user, "model-key.update", "runtime", detail, self.client_address[0]
+                )
+                self._json(result)
+                return
             if path == "/api/alert-rules":
                 payload = self._read_json()
                 rules = payload.get("rules")

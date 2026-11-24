@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#0b0e0f">
   <title>Spark Grid</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/css/app.css?v=20261124-20">
+  <link rel="stylesheet" href="/css/app.css?v=20261124-23">
 </head>
 <body>
   <div id="bootScreen" class="boot-screen">
@@ -127,13 +127,16 @@
           <i data-lucide="layout-dashboard"></i><span>总览</span>
         </button>
         <button class="nav-button" data-view="chat">
-          <i data-lucide="message-square"></i><span>模型测试</span>
+          <i data-lucide="message-square"></i><span>会话测试</span>
         </button>
         <button class="nav-button" data-scroll="modelServicePanel">
           <i data-lucide="power"></i><span>服务控制</span>
         </button>
         <button class="nav-button" data-scroll="modelLogPanel">
           <i data-lucide="terminal"></i><span>运行日志</span>
+        </button>
+        <button class="nav-button" data-view="keymgr">
+          <i data-lucide="key-round"></i><span>API Key</span>
         </button>
         <button class="nav-button" data-view="overview">
           <i data-lucide="arrow-left"></i><span>返回集群</span>
@@ -204,6 +207,6 @@
   <div id="toastRoot" class="toast-root" aria-live="polite"></div>
 
   <script src="/vendor/lucide.min.js"></script>
-  <script src="/js/app.js?v=20261124-20"></script>
+  <script src="/js/app.js?v=20261124-23"></script>
 </body>
 </html>
