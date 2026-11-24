@@ -2711,6 +2711,262 @@ svg {
   white-space: nowrap;
 }
 
+.model-service-phase {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex: none;
+  max-width: 150px;
+  min-width: 92px;
+  text-align: right;
+}
+
+.model-service-phase strong {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.model-service-phase small {
+  max-width: 100%;
+  overflow: hidden;
+  color: #5f6b64;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-service-phase.ready strong {
+  color: var(--green);
+}
+
+.model-service-phase.starting strong,
+.model-service-phase.stopping strong {
+  color: var(--amber);
+}
+
+.model-service-phase.failed strong {
+  color: var(--red);
+}
+
+.phase-bar {
+  display: block;
+  width: 100%;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.phase-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--amber);
+  transition: width 0.3s ease;
+}
+
+.model-service-actions {
+  margin-left: auto;
+}
+
+.model-service-panel .model-panel-head {
+  min-height: 44px;
+}
+
+.model-help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  margin-left: 5px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font: 700 9px/1 "Segoe UI", sans-serif;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.model-help-btn:hover {
+  color: var(--text);
+  border-color: var(--muted);
+  background: var(--panel-hover);
+}
+
+.page-head h2 .model-help-btn {
+  vertical-align: middle;
+  margin-top: -2px;
+}
+
+.model-log-title .model-help-btn {
+  margin-left: 6px;
+}
+
+.model-help-body {
+  font-size: 11px;
+  line-height: 1.75;
+  color: var(--text-soft);
+}
+
+.model-help-body p {
+  margin: 0 0 10px;
+}
+
+.model-help-body ul {
+  margin: 0 0 10px;
+  padding-left: 18px;
+}
+
+.model-help-body li {
+  margin-bottom: 7px;
+}
+
+.model-help-body strong {
+  color: var(--text);
+}
+
+.model-help-body code {
+  padding: 1px 5px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: var(--bg-raised);
+  color: var(--cyan);
+  font: 10px/1.4 Consolas, monospace;
+}
+
+.model-help-note {
+  margin: 0 !important;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.model-service-loading,
+.model-service-empty,
+.model-service-error {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 16px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.model-service-error {
+  color: var(--red);
+}
+
+.model-service-task {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 10px;
+}
+
+.model-service-task.running {
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.model-service-task.done {
+  background: rgba(63, 185, 80, 0.08);
+}
+
+.model-service-task.failed {
+  background: rgba(248, 81, 73, 0.1);
+}
+
+.model-service-task-icon {
+  display: inline-flex;
+  color: var(--blue);
+}
+
+.model-service-task.failed .model-service-task-icon {
+  color: var(--red);
+}
+
+.model-service-task-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.model-service-task-copy small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.model-service-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.model-service-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.model-service-row:last-child {
+  border-bottom: none;
+}
+
+.model-service-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: #5f6b64;
+}
+
+.model-service-dot.active {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(63, 185, 80, 0.16);
+}
+
+.model-service-dot.starting,
+.model-service-dot.stopping {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(210, 153, 34, 0.16);
+}
+
+.model-service-dot.failed {
+  background: var(--red);
+  box-shadow: 0 0 0 3px rgba(248, 81, 73, 0.16);
+}
+
+.model-service-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.model-service-copy strong {
+  font: 11px/1.3 Consolas, monospace;
+  color: var(--text);
+}
+
+.model-service-copy small {
+  color: var(--muted);
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .model-service-state {
   display: inline-flex;
   align-items: center;

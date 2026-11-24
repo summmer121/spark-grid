@@ -2344,12 +2344,15 @@
   }
 
   function modelServiceStateInfo(service) {
-    const active = String(service.active_state || "");
-    if (active === "active") return { key: "active", label: "运行中", cls: "active" };
-    if (active === "activating" || active === "reloading") return { key: "starting", label: "启动中", cls: "starting" };
-    if (active === "deactivating") return { key: "stopping", label: "停止中", cls: "stopping" };
-    if (active === "failed") return { key: "failed", label: "失败", cls: "failed" };
-    return { key: "inactive", label: "已停止", cls: "inactive" };
+    const phase = String(service.phase || "");
+    const label = service.phase_label || "";
+    if (phase === "ready") return { key: "ready", label: label || "已就绪", cls: "active" };
+    if (phase === "starting") return { key: "starting", label: label || "启动中", cls: "starting" };
+    if (phase === "warming") return { key: "warming", label: label || "引擎加载中", cls: "starting" };
+    if (phase === "completed") return { key: "completed", label: label || "脚本已完成", cls: "stopping" };
+    if (phase === "failed") return { key: "failed", label: label || "启动失败", cls: "failed" };
+    if (phase === "stopping") return { key: "stopping", label: label || "停止中", cls: "stopping" };
+    return { key: "stopped", label: label || "已停止", cls: "inactive" };
   }
 
   function modelServiceTaskHtml(task) {
@@ -2395,7 +2398,11 @@
               <strong>${escapeHtml(service.name || service.unit)}</strong>
               <small>${escapeHtml(service.description || service.unit)}</small>
             </div>
-            <em class="model-service-state ${info.cls}">${info.label}<i>${escapeHtml(service.active_state || "unknown")}/${escapeHtml(service.sub_state || "unknown")}</i></em>
+            <div class="model-service-phase ${info.cls}" title="${escapeHtml([service.phase_detail, service.error_hint].filter(Boolean).join(" · "))}">
+              <strong>${escapeHtml(info.label)}</strong>
+              ${service.phase_detail ? `<small>${escapeHtml(service.phase_detail)}</small>` : ""}
+              ${typeof service.progress === "number" ? `<span class="phase-bar"><i style="width:${Math.max(1, Math.min(100, service.progress))}%"></i></span>` : ""}
+            </div>
             <div class="model-service-actions">
               <button class="button ghost compact" data-action="model-service-start" data-unit="${unit}" ${busy || running ? "disabled" : ""}>${icon("play")}<span>启动</span></button>
               <button class="button ghost compact danger" data-action="model-service-stop" data-unit="${unit}" ${busy || !running ? "disabled" : ""}>${icon("square")}<span>停止</span></button>

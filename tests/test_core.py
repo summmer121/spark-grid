@@ -1262,6 +1262,91 @@ class ModelControlParsingTests(unittest.TestCase):
             ["model-glm53-guard.service"],
         )
 
+    def test_parse_duration_usec(self):
+        from app.model_control import _parse_duration_usec
+
+        self.assertEqual(_parse_duration_usec("3000s"), 3000)
+        self.assertEqual(_parse_duration_usec("50min"), 3000)
+        self.assertEqual(_parse_duration_usec("1h 30min"), 5400)
+        self.assertIsNone(_parse_duration_usec(""))
+        self.assertIsNone(_parse_duration_usec("infinity"))
+
+    def test_parse_timestamp(self):
+        from app.model_control import _parse_timestamp
+
+        self.assertIsNotNone(_parse_timestamp("Tue 2026-11-24 16:01:23 CST"))
+        self.assertIsNone(_parse_timestamp(""))
+        self.assertIsNone(_parse_timestamp("n/a"))
+
+    def _classify(self, **overrides):
+        service = {
+            "unit": "model_demo.service",
+            "Description": "Demo model service",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "UnitFileState": "disabled",
+            "Result": "success",
+            "ExecMainStatus": "0",
+            "ExecMainStartTimestamp": "Tue 2026-11-24 16:00:00 CST",
+            "ExecMainExitTimestamp": "",
+            "TimeoutStartUSec": "3000s",
+        }
+        service.update(overrides)
+        now = service.pop("__now__", 1795510000.0)
+        return self.control._classify(
+            service, now, service.pop("__containers__", []), service.pop("__health__", {}), [8888]
+        )
+
+    def test_classify_starting_with_progress(self):
+        from app.model_control import _parse_timestamp
+
+        start = _parse_timestamp("Tue 2026-11-24 16:00:00 CST")
+        out = self._classify(
+            ActiveState="activating",
+            SubState="start",
+            __now__=start + 600,
+        )
+        self.assertEqual(out["phase"], "starting")
+        self.assertEqual(out["phase_label"], "启动中")
+        self.assertAlmostEqual(out["progress"], 20.0, places=1)
+        self.assertEqual(out["elapsed_seconds"], 600)
+        self.assertEqual(out["timeout_seconds"], 3000)
+
+    def test_classify_ready_needs_health(self):
+        out = self._classify(
+            ActiveState="active",
+            SubState="exited",
+            __containers__=["demo|running"],
+            __health__={8888: 200},
+        )
+        self.assertEqual(out["phase"], "ready")
+        self.assertEqual(out["healthy_port"], 8888)
+
+    def test_classify_warming_when_container_up_without_health(self):
+        out = self._classify(
+            ActiveState="active",
+            SubState="exited",
+            __containers__=["demo|running"],
+            __health__={8888: 503},
+        )
+        self.assertEqual(out["phase"], "warming")
+        self.assertIn("等待 /health", out["phase_detail"])
+
+    def test_classify_failed_exit_code(self):
+        out = self._classify(
+            ActiveState="failed",
+            SubState="failed",
+            Result="exit-code",
+            ExecMainStatus="137",
+        )
+        self.assertEqual(out["phase"], "failed")
+        self.assertIn("退出码 137", out["phase_detail"])
+
+    def test_classify_stopped(self):
+        out = self._classify()
+        self.assertEqual(out["phase"], "stopped")
+        self.assertEqual(out["phase_label"], "已停止")
+
     def test_related_guards_match_by_unit_dependency(self):
         # v41f and ds41f-guard share no name token; the unit's Before= does.
         guards = [
