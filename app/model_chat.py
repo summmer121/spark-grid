@@ -23,6 +23,41 @@ KEY_TTL_SECONDS = 600.0
 CHAT_TIMEOUT_SECONDS = 300.0
 MAX_MESSAGES = 60
 MAX_CONTENT_CHARS = 32000
+MAX_IMAGES = 4
+MAX_IMAGE_CHARS = 4 * 1024 * 1024  # base64 payload cap (~3 MB image)
+MAX_PARTS = 12
+
+
+def _normalize_content(content: Any) -> Any:
+    """Accept a plain string or an OpenAI multimodal content array."""
+    if isinstance(content, str):
+        return content[:MAX_CONTENT_CHARS]
+    if not isinstance(content, list):
+        return ""
+    parts: list[dict[str, Any]] = []
+    images = 0
+    for item in content[:MAX_PARTS]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "")
+        if kind == "text":
+            text = str(item.get("text") or "")[:MAX_CONTENT_CHARS]
+            if text:
+                parts.append({"type": "text", "text": text})
+        elif kind == "image_url":
+            image = item.get("image_url")
+            if not isinstance(image, dict):
+                continue
+            url = str(image.get("url") or "")
+            if not url.startswith("data:image/"):
+                continue
+            if len(url) > MAX_IMAGE_CHARS:
+                continue
+            if images >= MAX_IMAGES:
+                continue
+            images += 1
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
 
 
 class ChatError(RuntimeError):
@@ -63,24 +98,48 @@ class ModelChat:
         if not containers:
             raise ChatError("HEAD 节点上没有运行中的模型容器")
         for name in containers:
+            quoted = shlex.quote(name)
+            # 1) Docker secret (docker compose secret file)
             try:
                 output = self.control._run(
                     [
                         "bash",
                         "-lc",
-                        f"docker exec {shlex.quote(name)} cat /run/secrets/model-api-key 2>/dev/null",
+                        f"docker exec {quoted} cat /run/secrets/model-api-key 2>/dev/null",
+                    ],
+                    timeout=15.0,
+                )
+            except SSHError:
+                output = ""
+            lines = (output or "").strip().splitlines()
+            if lines and lines[-1].strip():
+                return self._remember_key(lines[-1].strip())
+            # 2) Container environment (docker run -e VLLM_API_KEY=...)
+            try:
+                env_output = self.control._run(
+                    [
+                        "bash",
+                        "-lc",
+                        f"docker inspect {quoted} --format "
+                        "'{{range .Config.Env}}{{println .}}{{end}}'",
                     ],
                     timeout=15.0,
                 )
             except SSHError:
                 continue
-            key = (output or "").strip().splitlines()
-            if key and key[-1].strip():
-                value = key[-1].strip()
-                with self._lock:
-                    self._key_cache = (now, value)
-                return value
-        raise ChatError("未能从容器 secret 读取模型 API Key")
+            for raw in (env_output or "").splitlines():
+                line = raw.strip()
+                for prefix in ("VLLM_API_KEY=", "OPENAI_API_KEY=", "API_KEY="):
+                    if line.startswith(prefix):
+                        value = line[len(prefix):].strip()
+                        if len(value) >= 8:
+                            return self._remember_key(value)
+        raise ChatError("未能读取模型 API Key（容器 secret 与环境变量中均未找到）")
+
+    def _remember_key(self, value: str) -> str:
+        with self._lock:
+            self._key_cache = (time.time(), value)
+        return value
 
     def _request(self, path: str, payload: dict[str, Any] | None = None, stream: bool = False):
         host, port = self._endpoint()
@@ -98,6 +157,13 @@ class ModelChat:
             return urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
+            lowered = detail.lower()
+            if "multimodal" in lowered:
+                raise ChatError(
+                    "当前模型不支持图片输入（非多模态模型），请改用文本文件或切换到多模态模型。"
+                ) from exc
+            if "maximum context" in lowered or "too long" in lowered:
+                raise ChatError("输入超出模型上下文长度，请缩短消息或减少附件。") from exc
             raise ChatError(f"模型服务返回 {exc.code}: {detail[:300]}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ChatError(f"无法连接模型服务 {host}:{port}（{exc}）") from exc
@@ -110,15 +176,26 @@ class ModelChat:
             host, port = self._endpoint()
             response = self._request("/v1/models")
             payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
-            models = [
-                str(item.get("id"))
-                for item in payload.get("data", [])
-                if isinstance(item, dict) and item.get("id")
-            ]
+            # vLLM lists both --served-model-name and the model path basename for
+            # one deployment; collapse entries that share the same root.
+            models: list[str] = []
+            aliases: dict[str, list[str]] = {}
+            seen: dict[str, str] = {}
+            for item in payload.get("data", []):
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                model_id = str(item["id"])
+                root = str(item.get("root") or model_id)
+                if root in seen:
+                    aliases.setdefault(seen[root], []).append(model_id)
+                    continue
+                seen[root] = model_id
+                models.append(model_id)
             return {
                 "available": True,
                 "endpoint": f"http://{host}:{port}",
                 "models": models,
+                "aliases": aliases,
                 "error": "",
             }
         except ChatError as exc:
@@ -143,7 +220,7 @@ class ModelChat:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role") or "").strip()
-            content = str(item.get("content") or "")[:MAX_CONTENT_CHARS]
+            content = _normalize_content(item.get("content"))
             if role not in ("system", "user", "assistant") or not content:
                 continue
             messages.append({"role": role, "content": content})
@@ -151,27 +228,36 @@ class ModelChat:
             raise ChatError("没有有效的对话消息")
 
         model = str(body.get("model") or "").strip()
-        max_tokens = int(body.get("max_tokens") or 512)
-        max_tokens = max(1, min(8192, max_tokens))
-        try:
-            temperature = float(body.get("temperature", 0.7))
-        except (TypeError, ValueError):
-            temperature = 0.7
-        temperature = max(0.0, min(2.0, temperature))
-
-        enable_thinking = bool(body.get("enable_thinking"))
         payload: dict[str, Any] = {
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": max_tokens,
-            "temperature": temperature,
         }
+        # max_tokens is optional: omit it so the engine uses its own limit.
+        raw_max = body.get("max_tokens")
+        if raw_max not in (None, "", 0):
+            try:
+                max_tokens = int(raw_max)
+            except (TypeError, ValueError):
+                max_tokens = 0
+            if max_tokens > 0:
+                payload["max_tokens"] = max(1, min(131072, max_tokens))
+        raw_temperature = body.get("temperature")
+        if raw_temperature not in (None, ""):
+            try:
+                temperature = float(raw_temperature)
+            except (TypeError, ValueError):
+                temperature = None
+            if temperature is not None:
+                payload["temperature"] = max(0.0, min(2.0, temperature))
         if model:
             payload["model"] = model
-        if not enable_thinking:
-            # vLLM chat template switches; harmless for models without support.
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        # Thinking is on unless explicitly disabled.
+        enable_thinking = body.get("enable_thinking")
+        if enable_thinking is None:
+            enable_thinking = True
+        # Explicit switch: some chat templates default thinking to off.
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(enable_thinking)}
 
         started = time.perf_counter()
         ttft_ms: float | None = None

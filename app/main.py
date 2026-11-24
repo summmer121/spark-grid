@@ -1038,7 +1038,7 @@ class SparkGridHandler(BaseHTTPRequestHandler):
         return valid
 
     def _model_chat_stream(self) -> None:
-        payload = self._read_json()
+        payload = self._read_json(max_bytes=16_000_000)
         self.send_response(200)
         self._security_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1092,7 +1092,7 @@ class SparkGridHandler(BaseHTTPRequestHandler):
             stream_open = False
 
     def _model_chat(self) -> None:
-        payload = self._read_json()
+        payload = self._read_json(max_bytes=16_000_000)
         try:
             result = self.app.model_chat.chat(payload)
         except ChatError as exc:
@@ -1494,12 +1494,18 @@ class SparkGridHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
-    def _read_json(self, optional: bool = False) -> dict[str, Any]:
-        length = _safe_int(self.headers.get("Content-Length"), 0, 0, 2_000_000)
+    def _read_json(
+        self, optional: bool = False, max_bytes: int = 2_000_000
+    ) -> dict[str, Any]:
+        length = _safe_int(
+            self.headers.get("Content-Length"), 0, 0, 1 << 62
+        )
         if length == 0:
             if optional:
                 return {}
             raise ValueError("missing JSON body")
+        if length > max_bytes:
+            raise ValueError(f"请求体过大（上限 {max_bytes // 1024} KB）")
         raw = self.rfile.read(length)
         try:
             payload = json.loads(raw.decode("utf-8"))

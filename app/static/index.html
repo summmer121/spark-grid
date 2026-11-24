@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#0b0e0f">
   <title>Spark Grid</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/css/app.css?v=20261124-14">
+  <link rel="stylesheet" href="/css/app.css?v=20261124-20">
 </head>
 <body>
   <div id="bootScreen" class="boot-screen">
@@ -101,12 +101,12 @@
           <span>集群监控中心</span>
         </div>
       </div>
-      <nav class="main-nav" aria-label="主导航">
+      <nav class="main-nav cluster-nav" aria-label="集群导航">
         <button class="nav-button active" data-view="overview">
           <i data-lucide="layout-dashboard"></i><span>总览</span>
         </button>
-        <button class="nav-button" data-view="chat">
-          <i data-lucide="message-square"></i><span>模型测试</span>
+        <button class="nav-button" data-view="model">
+          <i data-lucide="brain-circuit"></i><span>模型管理</span>
         </button>
         <button class="nav-button" data-view="nodes">
           <i data-lucide="server"></i><span>节点管理</span>
@@ -120,6 +120,23 @@
         </button>
         <button class="nav-button" data-view="audit">
           <i data-lucide="scroll-text"></i><span>操作审计</span>
+        </button>
+      </nav>
+      <nav class="main-nav model-nav" id="modelNav" aria-label="模型导航" hidden>
+        <button class="nav-button" data-view="model">
+          <i data-lucide="layout-dashboard"></i><span>总览</span>
+        </button>
+        <button class="nav-button" data-view="chat">
+          <i data-lucide="message-square"></i><span>模型测试</span>
+        </button>
+        <button class="nav-button" data-scroll="modelServicePanel">
+          <i data-lucide="power"></i><span>服务控制</span>
+        </button>
+        <button class="nav-button" data-scroll="modelLogPanel">
+          <i data-lucide="terminal"></i><span>运行日志</span>
+        </button>
+        <button class="nav-button" data-view="overview">
+          <i data-lucide="arrow-left"></i><span>返回集群</span>
         </button>
       </nav>
       <div class="sidebar-section">
@@ -187,6 +204,6 @@
   <div id="toastRoot" class="toast-root" aria-live="polite"></div>
 
   <script src="/vendor/lucide.min.js"></script>
-  <script src="/js/app.js?v=20261124-14"></script>
+  <script src="/js/app.js?v=20261124-20"></script>
 </body>
 </html>

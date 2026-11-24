@@ -4564,7 +4564,113 @@ svg {
 
 .chat-reasoning div {
   margin-top: 5px;
+  max-height: 260px;
+  overflow-y: auto;
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.chat-hint {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #5f6b64;
+  font-size: 9px;
+}
+
+.chat-attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.chat-attach:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--muted);
+}
+
+.chat-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chat-attachments:empty {
+  display: none;
+}
+
+.chat-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  font-size: 9px;
+  color: var(--text-soft);
+}
+
+.chat-chip img {
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+.chat-chip-icon {
+  display: inline-flex;
+  color: var(--muted);
+}
+
+.chat-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-chip-remove {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.chat-chip-remove:hover {
+  color: var(--red);
+}
+
+.chat-bubble-image {
+  display: block;
+  max-width: 260px;
+  max-height: 200px;
+  margin-bottom: 6px;
+  border-radius: 6px;
+  object-fit: contain;
+}
+
+.chat-bubble-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 6px;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 9px;
 }

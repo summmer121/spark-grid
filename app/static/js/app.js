@@ -12,6 +12,7 @@
     chatInfo: null,
     chat: {
       messages: [],
+      attachments: [],
       busy: false,
       lastStats: null,
       totals: { turns: 0, prompt: 0, completion: 0, genMs: 0 },
@@ -693,10 +694,19 @@
     });
   }
 
+  const MODEL_VIEWS = new Set(["model", "chat"]);
+
   function navigate(view, loadData = true) {
     if (!viewMeta[view]) view = "overview";
     state.view = view;
+    const inModel = MODEL_VIEWS.has(view);
+    const clusterNav = $(".cluster-nav");
+    const modelNav = $("#modelNav");
+    if (clusterNav) clusterNav.hidden = inModel;
+    if (modelNav) modelNav.hidden = !inModel;
     $$(".nav-button").forEach((button) => {
+      if (button.closest("#modelNav") && !inModel) return;
+      if (button.closest(".cluster-nav") && inModel) return;
       button.classList.toggle("active", button.dataset.view === view);
     });
     $$(".runtime-tab").forEach((button) => {
@@ -2389,13 +2399,28 @@
       : "";
     const reasoningHtml =
       !isUser && message.reasoning
-        ? `<details class="chat-reasoning"><summary>思考过程 · ${message.reasoning.length} 字符</summary><div>${escapeHtml(message.reasoning)}</div></details>`
+        ? `<details class="chat-reasoning" open><summary>思考过程 · ${message.reasoning.length} 字符</summary><div>${escapeHtml(message.reasoning)}</div></details>`
         : "";
-    const body = message.content || (message.reasoning ? "（仅输出思考内容，未产生正式回复）" : "(空响应)");
+    const textContent =
+      typeof message.content === "string"
+        ? message.content
+        : (message.content || [])
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("\n");
+    const attachmentHtml = (message.attachments || [])
+      .map((item) =>
+        item.kind === "image"
+          ? `<img class="chat-bubble-image" src="${item.dataUrl}" alt="${escapeHtml(item.name)}">`
+          : `<span class="chat-bubble-file">${icon("file-text")}<span>${escapeHtml(item.name)}</span></span>`,
+      )
+      .join("");
+    const body = textContent || (message.reasoning ? "（仅输出思考内容，未产生正式回复）" : "(空响应)");
     return `
       <div class="chat-bubble ${isUser ? "user" : "assistant"}">
         <div class="chat-bubble-role">${isUser ? "你" : "模型"}</div>
         ${reasoningHtml}
+        ${attachmentHtml}
         <div class="chat-bubble-content">${escapeHtml(body)}</div>
         ${metricsHtml}
       </div>`;
@@ -2431,6 +2456,92 @@
       </div>`;
   }
 
+  function chatAttachmentsHtml() {
+    const items = state.chat.attachments || [];
+    if (!items.length) return "";
+    return items
+      .map((item, index) => {
+        const preview =
+          item.kind === "image"
+            ? `<img src="${item.dataUrl}" alt="${escapeHtml(item.name)}">`
+            : `<span class="chat-chip-icon">${icon("file-text")}</span>`;
+        return `
+          <span class="chat-chip" title="${escapeHtml(item.name)}">
+            ${preview}
+            <span class="chat-chip-name">${escapeHtml(item.name)}</span>
+            <button class="chat-chip-remove" data-action="chat-remove-attachment" data-index="${index}" title="移除" aria-label="移除">×</button>
+          </span>`;
+      })
+      .join("");
+  }
+
+  function renderChatAttachments() {
+    const box = $("#chatAttachments");
+    if (!box) return;
+    box.innerHTML = chatAttachmentsHtml();
+    refreshIcons(box);
+  }
+
+  function readChatFile(file) {
+    return new Promise((resolve) => {
+      const isImage = file.type.startsWith("image/");
+      if (isImage) {
+        if (file.size > 3 * 1024 * 1024) {
+          showToast(`图片过大：${file.name}（上限 3 MB）`, "error");
+          resolve(null);
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () =>
+          resolve({ kind: "image", name: file.name, dataUrl: String(reader.result || "") });
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(file);
+        return;
+      }
+      if (file.size > 200 * 1024) {
+        showToast(`文件过大：${file.name}（文本上限 200 KB）`, "error");
+        resolve(null);
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () =>
+        resolve({ kind: "file", name: file.name, text: String(reader.result || "") });
+      reader.onerror = () => resolve(null);
+      reader.readAsText(file);
+    });
+  }
+
+  async function addChatFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    const images = (state.chat.attachments || []).filter((a) => a.kind === "image").length;
+    for (const file of files) {
+      if (file.type.startsWith("image/") && images >= 4) {
+        showToast("最多附加 4 张图片", "error");
+        break;
+      }
+      const item = await readChatFile(file);
+      if (item) state.chat.attachments.push(item);
+    }
+    renderChatAttachments();
+  }
+
+  function buildChatContent(text) {
+    const attachments = state.chat.attachments || [];
+    if (!attachments.length) return text;
+    const fileText = attachments
+      .filter((a) => a.kind === "file")
+      .map((a) => `<file name="${a.name}">\n${a.text}\n</file>`)
+      .join("\n\n");
+    const merged = [text, fileText].filter(Boolean).join("\n\n");
+    const parts = [];
+    if (merged) parts.push({ type: "text", text: merged });
+    for (const a of attachments.filter((item) => item.kind === "image")) {
+      parts.push({ type: "image_url", image_url: { url: a.dataUrl } });
+    }
+    return parts;
+  }
+
   function renderChat() {
     const info = state.chatInfo;
     const models = info?.models || [];
@@ -2438,6 +2549,11 @@
       ? models.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join("")
       : '<option value="">未发现模型</option>';
     const busy = state.chat.busy;
+    const aliasCount = Object.values(info?.aliases || {}).reduce(
+      (total, list) => total + (list?.length || 0),
+      0,
+    );
+    const aliasHint = aliasCount ? ` · 已合并 ${aliasCount} 个同模型别名` : "";
     $("#content").innerHTML = `
       ${pageHead(
         "模型测试",
@@ -2450,13 +2566,14 @@
         <div class="chat-main">
           <div class="chat-toolbar">
             <label class="chat-field">模型<select id="chatModel" class="select">${options}</select></label>
-            <label class="chat-field">最大输出<input id="chatMaxTokens" class="text-input" type="number" value="512" min="1" max="8192"></label>
-            <label class="chat-field">温度<input id="chatTemperature" class="text-input" type="number" value="0.7" min="0" max="2" step="0.1"></label>
-            <label class="chat-field chat-check"><input id="chatThinking" type="checkbox"> 启用思考</label>
+            <span class="chat-hint">${icon("sparkles")} 默认开启思考 · 流式输出 · 支持粘贴截图 / 文件${aliasHint}</span>
           </div>
           <div class="chat-messages" id="chatMessages"></div>
+          <div class="chat-attachments" id="chatAttachments">${chatAttachmentsHtml()}</div>
           <div class="chat-composer">
-            <textarea id="chatInput" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行" ${busy ? "disabled" : ""}></textarea>
+            <input type="file" id="chatFileInput" hidden multiple accept="image/*,.txt,.md,.json,.csv,.log,.yaml,.yml,.ini,.conf,.py,.sh,.js,.ts">
+            <button class="chat-attach" data-action="chat-attach" title="添加图片或文件" aria-label="添加图片或文件" ${busy ? "disabled" : ""}>${icon("paperclip")}</button>
+            <textarea id="chatInput" rows="2" placeholder="输入消息，支持粘贴截图 / 拖入图片或文件，Enter 发送，Shift+Enter 换行" ${busy ? "disabled" : ""}></textarea>
             <button class="primary-button" data-action="chat-send" ${busy ? "disabled" : ""}>${icon(busy ? "loader-circle" : "send")}<span>${busy ? "生成中" : "发送"}</span></button>
           </div>
         </div>
@@ -2483,6 +2600,7 @@
         if (!reasoning) {
           reasoning = document.createElement("details");
           reasoning.className = "chat-reasoning";
+          reasoning.open = true;
           reasoning.innerHTML = "<summary>思考过程</summary><div></div>";
           bubble.insertBefore(reasoning, bubble.querySelector(".chat-bubble-content"));
         }
@@ -2504,11 +2622,11 @@
     const text = (input?.value || "").trim();
     if (!text) return;
     const modelValue = $("#chatModel")?.value || "";
-    const maxTokens = Number($("#chatMaxTokens")?.value) || 512;
-    const temperature = Number($("#chatTemperature")?.value ?? 0.7);
-    const enableThinking = Boolean($("#chatThinking")?.checked);
 
-    state.chat.messages.push({ role: "user", content: text });
+    const content = buildChatContent(text);
+    const sentAttachments = (state.chat.attachments || []).slice();
+    state.chat.messages.push({ role: "user", content, attachments: sentAttachments });
+    state.chat.attachments = [];
     const assistant = { role: "assistant", content: "", reasoning: "", metrics: null };
     state.chat.messages.push(assistant);
     state.chat.busy = true;
@@ -2525,9 +2643,6 @@
         },
         body: JSON.stringify({
           model: modelValue,
-          max_tokens: maxTokens,
-          temperature,
-          enable_thinking: enableThinking,
           messages: state.chat.messages
             .slice(0, -1)
             .map((m) => ({ role: m.role, content: m.content })),
@@ -2968,7 +3083,7 @@
         <div class="model-event-item"><span>成功 / 失败</span><strong><span data-model-field="success-requests">${escapeHtml(fields["success-requests"])}</span> / <span data-model-field="failed-requests">${escapeHtml(fields["failed-requests"])}</span></strong></div>
         <div class="model-event-item"><span>日志错误</span><strong data-model-field="log-errors">${escapeHtml(fields["log-errors"])}</strong></div>
       </div>
-      <section class="model-log-panel">
+      <section class="model-log-panel" id="modelLogPanel">
         <div class="model-log-toolbar">
           <div class="model-log-title">${icon("terminal")}<span>模型运行日志</span>${helpButton("model-logs")}</div>
           <div class="model-log-actions">
@@ -3721,6 +3836,24 @@
 
   function bindEvents() {
     document.addEventListener("click", async (event) => {
+      const scrollItem = event.target.closest("[data-scroll]");
+      if (scrollItem && scrollItem.closest("#modelNav")) {
+        const targetId = scrollItem.dataset.scroll;
+        $$("#modelNav .nav-button").forEach((button) => {
+          button.classList.toggle("active", button === scrollItem);
+        });
+        const jump = () => {
+          const target = document.getElementById(targetId);
+          if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        };
+        if (state.view !== "model") {
+          navigate("model");
+          window.setTimeout(jump, 450);
+        } else {
+          jump();
+        }
+        return;
+      }
       const nav = event.target.closest("[data-view]");
       if (nav) {
         navigate(nav.dataset.view);
@@ -3810,6 +3943,11 @@
           openHelp(actionElement.dataset.help);
         } else if (action === "chat-send") {
           await sendChat();
+        } else if (action === "chat-attach") {
+          $("#chatFileInput")?.click();
+        } else if (action === "chat-remove-attachment") {
+          state.chat.attachments.splice(Number(actionElement.dataset.index), 1);
+          renderChatAttachments();
         } else if (action === "chat-reset") {
           resetChat();
         } else if (action === "alert-rules-save") {
@@ -3835,7 +3973,7 @@
       }
     });
 
-    document.addEventListener("change", (event) => {
+    document.addEventListener("change", async (event) => {
       const target = event.target;
       if (target.matches("[data-select-node]")) {
         const id = Number(target.dataset.selectNode);
@@ -3843,6 +3981,9 @@
         else state.selectedNodes.delete(id);
         renderNodes();
         refreshIcons($("#content"));
+      } else if (target.id === "chatFileInput") {
+        await addChatFiles(target.files);
+        target.value = "";
       } else if (target.matches("[data-discovery-host]")) {
         const host = target.dataset.discoveryHost;
         if (target.checked) state.selectedDiscovery.add(host);
@@ -3921,6 +4062,38 @@
         const extra = kind === "group" ? { group_name: raw } : { tags: raw };
         await executeBatch(kind, extra);
       } else if (form.id === "settingsForm") await saveSettings(form);
+    });
+
+    document.addEventListener("paste", async (event) => {
+      if (state.view !== "chat" || event.target?.id !== "chatInput") return;
+      const items = Array.from(event.clipboardData?.items || []);
+      const imageItems = items.filter(
+        (item) => item.kind === "file" && item.type.startsWith("image/"),
+      );
+      if (!imageItems.length) return;
+      event.preventDefault();
+      const files = imageItems
+        .map((item, index) => {
+          const file = item.getAsFile();
+          if (!file) return null;
+          const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+          if (file.name && file.name !== "image.png") return file;
+          return new File([file], `paste-${Date.now()}-${index}.${ext}`, { type: file.type });
+        })
+        .filter(Boolean);
+      if (files.length) await addChatFiles(files);
+    });
+
+    document.addEventListener("dragover", (event) => {
+      if (state.view !== "chat") return;
+      event.preventDefault();
+    });
+    document.addEventListener("drop", async (event) => {
+      if (state.view !== "chat") return;
+      const box = event.target.closest?.(".chat-main");
+      if (!box || !event.dataTransfer?.files?.length) return;
+      event.preventDefault();
+      await addChatFiles(event.dataTransfer.files);
     });
 
     document.addEventListener("keydown", (event) => {
