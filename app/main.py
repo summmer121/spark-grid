@@ -697,6 +697,9 @@ class SparkGridHandler(BaseHTTPRequestHandler):
             if path == "/api/model/chat":
                 self._model_chat()
                 return
+            if path == "/api/model/chat/stream":
+                self._model_chat_stream()
+                return
             if path == "/api/nodes/bulk":
                 self._bulk_add_nodes(user)
                 return
@@ -1033,6 +1036,60 @@ class SparkGridHandler(BaseHTTPRequestHandler):
         if not valid:
             self._error(403, "CSRF 校验失败")
         return valid
+
+    def _model_chat_stream(self) -> None:
+        payload = self._read_json()
+        self.send_response(200)
+        self._security_headers()
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        stream_open = True
+
+        def emit(event: dict[str, Any]) -> None:
+            nonlocal stream_open
+            if not stream_open:
+                return
+            data = (
+                "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+            ).encode("utf-8")
+            try:
+                self.wfile.write(f"{len(data):X}\r\n".encode("ascii") + data + b"\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                stream_open = False
+
+        try:
+            result = self.app.model_chat.chat(
+                payload,
+                on_delta=lambda text: emit({"type": "delta", "content": text}),
+                on_reasoning=lambda text: emit({"type": "reasoning", "content": text}),
+            )
+            emit(
+                {
+                    "type": "done",
+                    "usage": result.get("usage", {}),
+                    "metrics": result.get("metrics", {}),
+                    "reasoning": result.get("reasoning", ""),
+                    "content": result.get("content", ""),
+                }
+            )
+        except ChatError as exc:
+            emit({"type": "error", "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - report, do not kill the stream
+            LOGGER.exception("chat stream failed")
+            emit({"type": "error", "error": f"服务器内部错误: {exc}"})
+        finally:
+            if stream_open:
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            stream_open = False
 
     def _model_chat(self) -> None:
         payload = self._read_json()

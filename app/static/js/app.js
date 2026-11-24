@@ -2466,42 +2466,133 @@
     refreshIcons($("#content"));
   }
 
+  let chatPaintFrame = null;
+
+  function scheduleChatPaint() {
+    if (chatPaintFrame) return;
+    chatPaintFrame = requestAnimationFrame(() => {
+      chatPaintFrame = null;
+      const message = state.chat.messages[state.chat.messages.length - 1];
+      const box = $("#chatMessages");
+      if (!message || !box) return;
+      const bubbles = box.querySelectorAll(".chat-bubble");
+      const bubble = bubbles[bubbles.length - 1];
+      if (!bubble) return;
+      let reasoning = bubble.querySelector(".chat-reasoning");
+      if (message.reasoning) {
+        if (!reasoning) {
+          reasoning = document.createElement("details");
+          reasoning.className = "chat-reasoning";
+          reasoning.innerHTML = "<summary>思考过程</summary><div></div>";
+          bubble.insertBefore(reasoning, bubble.querySelector(".chat-bubble-content"));
+        }
+        reasoning.querySelector("div").textContent = message.reasoning;
+        reasoning.querySelector("summary").textContent = `思考过程 · ${message.reasoning.length} 字符`;
+      }
+      const content = bubble.querySelector(".chat-bubble-content");
+      if (content) {
+        content.textContent =
+          message.content || (message.reasoning ? "（思考中…）" : "…");
+      }
+      box.scrollTop = box.scrollHeight;
+    });
+  }
+
   async function sendChat() {
     if (state.chat.busy) return;
     const input = $("#chatInput");
     const text = (input?.value || "").trim();
     if (!text) return;
-    state.chat.messages.push({ role: "user", content: text });
-    state.chat.busy = true;
     const modelValue = $("#chatModel")?.value || "";
     const maxTokens = Number($("#chatMaxTokens")?.value) || 512;
     const temperature = Number($("#chatTemperature")?.value ?? 0.7);
+    const enableThinking = Boolean($("#chatThinking")?.checked);
+
+    state.chat.messages.push({ role: "user", content: text });
+    const assistant = { role: "assistant", content: "", reasoning: "", metrics: null };
+    state.chat.messages.push(assistant);
+    state.chat.busy = true;
     renderChat();
+
     try {
-      const payload = await api("/api/model/chat", {
+      const response = await fetch("/api/model/chat/stream", {
         method: "POST",
-        body: {
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "X-CSRF-Token": state.csrf || "",
+        },
+        body: JSON.stringify({
           model: modelValue,
           max_tokens: maxTokens,
           temperature,
-          enable_thinking: Boolean($("#chatThinking")?.checked),
-          messages: state.chat.messages.map((m) => ({ role: m.role, content: m.content })),
-        },
+          enable_thinking: enableThinking,
+          messages: state.chat.messages
+            .slice(0, -1)
+            .map((m) => ({ role: m.role, content: m.content })),
+        }),
       });
-      state.chat.lastStats = { ...(payload.usage || {}), ...(payload.metrics || {}) };
-      state.chat.messages.push({
-        role: "assistant",
-        content: payload.content || "",
-        reasoning: payload.reasoning || "",
-        metrics: state.chat.lastStats,
-      });
-      const totals = state.chat.totals;
-      totals.turns += 1;
-      totals.prompt += Number(payload.usage?.prompt_tokens || 0);
-      totals.completion += Number(payload.usage?.completion_tokens || 0);
-      totals.genMs += Number(payload.metrics?.generation_ms || 0);
+      if (!response.ok) {
+        let detail = `请求失败 (${response.status})`;
+        try {
+          const payload = await response.json();
+          if (payload?.error) detail = payload.error;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let doneEvent = null;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let index = buffer.indexOf("\n\n");
+        while (index >= 0) {
+          const block = buffer.slice(0, index).trim();
+          buffer = buffer.slice(index + 2);
+          if (block.startsWith("data:")) {
+            let event = null;
+            try {
+              event = JSON.parse(block.slice(5).trim());
+            } catch {
+              event = null;
+            }
+            if (event) {
+              if (event.type === "delta") {
+                assistant.content += event.content || "";
+                scheduleChatPaint();
+              } else if (event.type === "reasoning") {
+                assistant.reasoning += event.content || "";
+                scheduleChatPaint();
+              } else if (event.type === "done") {
+                doneEvent = event;
+              } else if (event.type === "error") {
+                throw new Error(event.error || "生成失败");
+              }
+            }
+          }
+          index = buffer.indexOf("\n\n");
+        }
+      }
+      if (doneEvent) {
+        assistant.metrics = { ...(doneEvent.usage || {}), ...(doneEvent.metrics || {}) };
+        state.chat.lastStats = assistant.metrics;
+        const totals = state.chat.totals;
+        totals.turns += 1;
+        totals.prompt += Number(doneEvent.usage?.prompt_tokens || 0);
+        totals.completion += Number(doneEvent.usage?.completion_tokens || 0);
+        totals.genMs += Number(doneEvent.metrics?.generation_ms || 0);
+      }
     } catch (error) {
       showToast(error.message, "error");
+      if (!assistant.content && !assistant.reasoning) {
+        assistant.content = `(${error.message})`;
+      }
     } finally {
       state.chat.busy = false;
       if (state.view === "chat") renderChat();

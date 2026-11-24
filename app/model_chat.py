@@ -129,7 +129,12 @@ class ModelChat:
                 "error": str(exc),
             }
 
-    def chat(self, body: dict[str, Any]) -> dict[str, Any]:
+    def chat(
+        self,
+        body: dict[str, Any],
+        on_delta: Any = None,
+        on_reasoning: Any = None,
+    ) -> dict[str, Any]:
         raw_messages = body.get("messages")
         if not isinstance(raw_messages, list) or not raw_messages:
             raise ChatError("消息不能为空")
@@ -199,8 +204,12 @@ class ModelChat:
                         ttft_ms = (time.perf_counter() - started) * 1000.0
                 if piece:
                     parts.append(str(piece))
+                    if on_delta is not None:
+                        on_delta(str(piece))
                 if reasoning_piece:
                     reasoning.append(str(reasoning_piece))
+                    if on_reasoning is not None:
+                        on_reasoning(str(reasoning_piece))
                 if choice.get("finish_reason"):
                     finish_reason = str(choice["finish_reason"])
                 if isinstance(chunk.get("usage"), dict):
