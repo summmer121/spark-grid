@@ -2701,9 +2701,97 @@ svg {
   font-size: 11px;
 }
 
+.chat-key-recovery {
+  margin-bottom: 10px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--orange) 38%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--orange) 7%, var(--panel));
+}
+
+.chat-key-recovery-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.chat-key-recovery-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--orange) 42%, var(--line));
+  border-radius: 6px;
+  color: var(--orange);
+}
+
+.chat-key-recovery-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.chat-key-recovery-head > div:nth-child(2) {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-key-recovery-head strong {
+  font-size: 11px;
+}
+
+.chat-key-recovery-head small {
+  overflow: hidden;
+  color: var(--text-soft);
+  font-size: 9px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+}
+
+.chat-key-recovery-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-key-recovery-actions code {
+  color: var(--cyan);
+  font: 9px Consolas, monospace;
+}
+
+.chat-key-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 12px 50px;
+}
+
+.chat-key-input-row .text-input {
+  flex: 1;
+  min-width: 0;
+}
+
 @media (max-width: 1100px) {
   .chat-layout {
     grid-template-columns: 1fr;
+  }
+
+  .chat-key-recovery-head,
+  .chat-key-input-row {
+    flex-wrap: wrap;
+  }
+
+  .chat-key-recovery-actions {
+    width: 100%;
+  }
+
+  .chat-key-input-row {
+    padding-left: 12px;
   }
 }
 
@@ -4720,6 +4808,26 @@ svg {
   border-bottom: 0;
 }
 
+.key-empty-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--orange) 38%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--orange) 8%, var(--panel));
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.key-empty-warning svg {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  color: var(--orange);
+}
+
 .key-label {
   color: var(--muted);
   font-size: 10px;
@@ -4755,19 +4863,6 @@ svg {
   white-space: pre;
 }
 
-.key-form {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 12px 14px 4px;
-}
-
-.key-form .text-input {
-  flex: 1;
-  min-width: 240px;
-}
-
 .key-hint {
   margin: 0;
   padding: 6px 14px 12px;
@@ -4783,4 +4878,13 @@ svg {
   background: var(--bg-raised);
   color: var(--cyan);
   font: 9px Consolas, monospace;
+}
+
+@media (max-width: 640px) {
+  .key-row {
+    grid-template-columns: 1fr;
+    align-items: start;
+    gap: 6px;
+  }
+
 }

@@ -21,6 +21,7 @@ from app.config import Settings, load_settings
 from app.db import Database
 from app.discovery import DiscoveryService, LocalIPv4Interface
 from app.main import SparkGridApp, SparkGridServer, _parse_bulk_lines
+from app.model_chat import ChatError, ModelChat
 from app.model_monitor import (
     ModelMonitor,
     _arg_value,
@@ -911,16 +912,20 @@ class HttpIntegrationTests(unittest.TestCase):
         self.temp.cleanup()
 
     def request(
-        self, path: str, method: str = "GET", body: dict | None = None
+        self,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        headers: dict[str, str] | None = None,
     ) -> tuple[int, dict]:
         data = json.dumps(body).encode() if body is not None else None
-        headers = {"Accept": "application/json"}
+        request_headers = {"Accept": "application/json", **(headers or {})}
         if data is not None:
-            headers["Content-Type"] = "application/json"
+            request_headers["Content-Type"] = "application/json"
         if self.csrf:
-            headers["X-CSRF-Token"] = self.csrf
+            request_headers["X-CSRF-Token"] = self.csrf
         request = urllib.request.Request(
-            self.base + path, data=data, headers=headers, method=method
+            self.base + path, data=data, headers=request_headers, method=method
         )
         try:
             with self.opener.open(request, timeout=5) as response:
@@ -989,6 +994,104 @@ class HttpIntegrationTests(unittest.TestCase):
         self.assertEqual(status, 200)
         status, _ = self.request("/api/session")
         self.assertEqual(status, 401)
+
+    def test_model_key_management_is_read_only(self) -> None:
+        self.login()
+        key = "sk-manual-model-key-for-test"
+        with (
+            patch.object(
+                self.application.model_chat,
+                "_read_container_key",
+                side_effect=ChatError("container key unavailable"),
+            ),
+            patch.object(
+                self.application.model_chat,
+                "_endpoint",
+                return_value=("192.0.2.50", 8000),
+            ),
+            patch.object(
+                self.application.model_chat,
+                "info",
+                return_value={
+                    "available": True,
+                    "models": ["deepseek-v4.1-flash"],
+                    "aliases": {},
+                    "error": "",
+                },
+            ),
+        ):
+            status, info = self.request("/api/model/key")
+            self.assertEqual(status, 200)
+            self.assertFalse(info["has_key"])
+            self.assertEqual(info["source"], "")
+
+            connection = sqlite3.connect(self.application.db.path)
+            try:
+                stored = connection.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    ("model_api_key_override",),
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertIsNone(stored)
+
+            status, _ = self.request(
+                "/api/model/key",
+                "PATCH",
+                {"key": key},
+            )
+            self.assertEqual(status, 404)
+
+    def test_model_key_probe_failure_returns_normal_read_only_payload(self) -> None:
+        self.login()
+        with (
+            patch.object(
+                self.application.model_chat,
+                "_read_container_key",
+                side_effect=RuntimeError("no running container"),
+            ),
+            patch.object(
+                self.application.model_chat,
+                "_endpoint",
+                side_effect=RuntimeError("no head node"),
+            ),
+        ):
+            status, info = self.request("/api/model/key")
+        self.assertEqual(status, 200)
+        self.assertFalse(info["has_key"])
+        self.assertIn("no running container", info["error"])
+
+    def test_chat_info_accepts_ephemeral_key_without_persisting_it(self) -> None:
+        self.login()
+        key = "sk-session-info-test-key"
+        with patch.object(
+            self.application.model_chat,
+            "info",
+            return_value={
+                "available": True,
+                "endpoint": "http://192.0.2.50:8000",
+                "models": ["deepseek-v4.1-flash"],
+                "aliases": {},
+                "error": "",
+            },
+        ) as info:
+            status, payload = self.request(
+                "/api/model/chat/info",
+                headers={"X-Model-API-Key": key},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["models"], ["deepseek-v4.1-flash"])
+        info.assert_called_once_with(api_key=key)
+
+        connection = sqlite3.connect(self.application.db.path)
+        try:
+            stored = connection.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                ("model_api_key_override",),
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertIsNone(stored)
 
     def test_password_auth_for_scan_bulk_add_and_edit(self) -> None:
         self.login()
@@ -1197,9 +1300,9 @@ class ModelChatValidationTests(unittest.TestCase):
     """Input validation for the chat playground proxy."""
 
     def setUp(self):
-        from app.model_chat import ModelChat
-
         self.chat = ModelChat.__new__(ModelChat)
+        self.chat._lock = threading.Lock()
+        self.chat._key_cache = (0.0, "")
 
     def test_rejects_empty_messages(self):
         from app.model_chat import ChatError
@@ -1216,6 +1319,91 @@ class ModelChatValidationTests(unittest.TestCase):
             self.chat.chat({"messages": [{"role": "tool", "content": "x"}]})
         with self.assertRaises(ChatError):
             self.chat.chat({"messages": [{"role": "user", "content": ""}]})
+
+    def test_session_manual_key_bypasses_container_key_only_explicitly(self):
+        key = "sk-session-only-test-key"
+        with patch.object(
+            self.chat,
+            "_read_container_key",
+            return_value="container-key",
+        ) as read_container:
+            self.assertEqual(self.chat._api_key(key), key)
+            read_container.assert_not_called()
+
+        with self.assertRaises(ChatError):
+            self.chat._api_key("short")
+
+    def test_endpoint_probes_ports_and_skips_closed_service(self):
+        self.chat.config = SimpleNamespace(
+            current=lambda: SimpleNamespace(
+                model_ports=(8888, 8000),
+                model_scheme="http",
+                model_health_path="/health",
+            )
+        )
+        self.chat.control = SimpleNamespace(
+            _head=lambda: {"host": "192.0.2.50"}
+        )
+        self.chat._endpoint_lock = threading.Lock()
+        self.chat._endpoint_cache = (0.0, "", (), 0)
+
+        with patch.object(
+            self.chat,
+            "_endpoint_ready",
+            side_effect=lambda host, port: port == 8000,
+        ):
+            self.assertEqual(self.chat._endpoint(), ("192.0.2.50", 8000))
+
+    def test_request_allows_models_probe_without_container_key(self):
+        self.chat.config = SimpleNamespace(
+            current=lambda: SimpleNamespace(model_scheme="http")
+        )
+        with (
+            patch.object(
+                self.chat,
+                "_endpoint",
+                return_value=("192.0.2.50", 8000),
+            ),
+            patch.object(
+                self.chat,
+                "_api_key",
+                side_effect=ChatError("container key missing"),
+            ),
+            patch("app.model_chat.urllib.request.urlopen") as urlopen,
+        ):
+            self.chat._request("/v1/models")
+
+        request = urlopen.call_args.args[0]
+        self.assertIsNone(request.get_header("Authorization"))
+
+    def test_chat_forwards_session_key_to_request(self):
+        key = "sk-session-only-test-key"
+
+        class FakeResponse:
+            def __iter__(self):
+                yield (
+                    b'data: {"choices":[{"delta":{"content":"OK"},'
+                    b'"finish_reason":"stop"}],"usage":{"prompt_tokens":1,'
+                    b'"completion_tokens":1}}\n\n'
+                )
+                yield b"data: [DONE]\n\n"
+
+            def close(self):
+                return None
+
+        with patch.object(
+            self.chat,
+            "_request",
+            return_value=FakeResponse(),
+        ) as request:
+            result = self.chat.chat(
+                {"messages": [{"role": "user", "content": "hello"}]},
+                api_key=key,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content"], "OK")
+        self.assertEqual(request.call_args.kwargs["api_key"], key)
 
 
 class ModelControlParsingTests(unittest.TestCase):

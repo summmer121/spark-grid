@@ -16,6 +16,9 @@
       messages: [],
       attachments: [],
       busy: false,
+      manualKey: "",
+      manualKeyOpen: false,
+      lastError: "",
       lastStats: null,
       totals: { turns: 0, prompt: 0, completion: 0, genMs: 0 },
     },
@@ -884,10 +887,11 @@
     },
     "model-key": {
       title: "API Key 管理说明",
-      html: `<p>这里显示模型服务当前生效的访问 Key，并生成可直接复制的 curl 示例。</p>
+      html: `<p>这里只读显示从模型容器自动获取的访问 Key，并生成可直接复制的 curl 示例。</p>
         <ul>
           <li><strong>来源</strong>：容器 secret 或容器环境变量中的服务端真实 Key。</li>
-          <li><strong>用途</strong>：页面提供 Key 查看、复制与 curl 示例，便于快速对接客户端。</li>
+          <li><strong>用途</strong>：页面提供 Key 查看、复制与 curl 示例；不会在这里修改 Key。</li>
+          <li><strong>临时输入</strong>：会话测试调用失败时，可在该页面手动输入仅用于当前会话测试的临时 Key。</li>
           <li><strong>服务端换 Key</strong>：需要修改容器启动参数（<code>--api-key</code> 或 <code>VLLM_API_KEY</code>）并重启模型服务，会中断推理。</li>
         </ul>`,
     },
@@ -898,7 +902,8 @@
           <li><strong>输入 / 输出 Token</strong>：取自引擎返回的 usage（<code>stream_options.include_usage</code>）。</li>
           <li><strong>TTFT</strong>：从发出请求到收到第一个内容 token 的时间，反映 prefill 速度。</li>
           <li><strong>吞吐</strong>：输出 token 数除以首 token 之后的生成耗时（tok/s）。</li>
-          <li>请求由中心服务转发到 HEAD 节点的模型端口，API Key 从容器 secret 读取，不会出现在页面或日志中。</li>
+          <li>请求由中心服务转发到 HEAD 节点的模型端口，API Key 默认从容器读取，不会写入日志。</li>
+          <li>调用报错后可在提示条中手动输入临时 Key；该值只保存在当前页面内存，仅用于会话测试，刷新或新会话后清除。</li>
         </ul>`,
     },
     "model-logs": {
@@ -2391,11 +2396,15 @@
     ];
   }
 
-  async function loadChatInfo() {
+  async function loadChatInfo(apiKey = state.chat.manualKey || "") {
     try {
-      state.chatInfo = await api("/api/model/chat/info");
+      state.chatInfo = await api("/api/model/chat/info", {
+        headers: apiKey ? { "X-Model-API-Key": apiKey } : {},
+      });
+      state.chat.lastError = "";
     } catch (error) {
       state.chatInfo = { available: false, error: error.message, models: [], endpoint: "" };
+      state.chat.lastError = error.message;
     }
     if (state.view === "chat") renderChat();
   }
@@ -2563,6 +2572,18 @@
       state.keyInfo = await api("/api/model/key");
     } catch (error) {
       if (error.status !== 401) showToast(error.message, "error");
+      state.keyInfo = {
+        key: "",
+        has_key: false,
+        source: "",
+        override: false,
+        container_key: "",
+        endpoint: "",
+        model: "",
+        models: [],
+        curl: "",
+        error: error.message || "自动读取失败",
+      };
     }
     if (state.view === "keymgr") renderKeyManager();
   }
@@ -2610,12 +2631,10 @@
       return;
     }
     const sourceLabel =
-      info.source === "override"
-        ? "平台覆盖"
-        : info.source === "container"
-          ? "容器（服务端真实 Key）"
-          : "未找到";
+      info.source === "container" ? "容器（服务端真实 Key）" : "未自动读取";
     const shown = state.keyVisible ? info.key || "—" : maskKey(info.key);
+    const keyMissing = !info.has_key;
+    const keyError = String(info.error || "").trim();
     $("#content").innerHTML = `
       ${pageHead(
         "API Key 管理",
@@ -2623,13 +2642,18 @@
         `<button class="button secondary compact" data-action="key-refresh">${icon("refresh-cw")}<span>刷新</span></button>`,
         "model-key",
       )}
+      ${keyMissing ? `
+        <div class="key-empty-warning">
+          ${icon("alert-triangle")}
+          <span>${keyError ? `自动读取失败：${escapeHtml(keyError)}` : "未自动读取到 Key。会话测试报错后可在该页面手动输入临时 Key。"}</span>
+        </div>` : ""}
       <section class="key-panel">
         <div class="key-row">
           <span class="key-label">当前 Key</span>
           <div class="key-value">
             <code>${escapeHtml(shown)}</code>
-            <button class="icon-button subtle" data-action="key-toggle-visible" title="${state.keyVisible ? "隐藏" : "显示"}" aria-label="显示或隐藏">${icon(state.keyVisible ? "eye-off" : "eye")}</button>
-            <button class="button ghost compact" data-action="key-copy">${icon("copy")}<span>复制</span></button>
+            <button class="icon-button subtle" data-action="key-toggle-visible" title="${state.keyVisible ? "隐藏" : "显示"}" aria-label="显示或隐藏" ${info.has_key ? "" : "disabled"}>${icon(state.keyVisible ? "eye-off" : "eye")}</button>
+            <button class="button ghost compact" data-action="key-copy" ${info.has_key ? "" : "disabled"}>${icon("copy")}<span>复制</span></button>
           </div>
         </div>
         <div class="key-row">
@@ -2652,38 +2676,37 @@
           <button class="button ghost compact" data-action="key-copy-curl">${icon("copy")}<span>复制命令</span></button>
         </div>
         <pre class="key-curl">${escapeHtml(info.curl || "（模型服务不可用，无法生成示例）")}</pre>
-      </section>
       </section>`;
     refreshIcons($("#content"));
   }
 
-  async function saveModelKey() {
-    const value = ($("#keyInput")?.value || "").trim();
-    if (value.length < 8) {
-      showToast("Key 至少需要 8 个字符", "error");
-      return;
-    }
-    try {
-      state.keyInfo = await api("/api/model/key", { method: "PATCH", body: { key: value } });
-      state.keyVisible = false;
-      renderKeyManager();
-      showToast("平台 Key 覆盖已保存", "success");
-    } catch (error) {
-      showToast(error.message, "error");
-    }
-  }
-
-  function clearModelKey() {
-    confirmDialog("清除平台 Key 覆盖", "将恢复使用容器内的服务端 Key。", "清除", async () => {
-      try {
-        state.keyInfo = await api("/api/model/key", { method: "PATCH", body: { clear: true } });
-        state.keyVisible = false;
-        renderKeyManager();
-        showToast("已清除平台覆盖", "success");
-      } catch (error) {
-        showToast(error.message, "error");
-      }
-    });
+  function chatKeyRecoveryHtml() {
+    const error = String(state.chat.lastError || state.chatInfo?.error || "").trim();
+    if (!error) return "";
+    const hasManualKey = Boolean(state.chat.manualKey);
+    const inputHtml = state.chat.manualKeyOpen
+      ? `
+        <div class="chat-key-input-row">
+          <input id="chatManualKey" class="text-input" type="password" autocomplete="new-password" spellcheck="false" placeholder="输入临时 API Key">
+          <button class="primary-button compact" data-action="chat-key-save">${icon("check")}<span>使用</span></button>
+          <button class="button ghost compact" data-action="chat-key-cancel">${icon("x")}<span>取消</span></button>
+        </div>`
+      : "";
+    return `
+      <div class="chat-key-recovery">
+        <div class="chat-key-recovery-head">
+          <span class="chat-key-recovery-icon">${icon("key-round")}</span>
+          <div>
+            <strong>${hasManualKey ? "已设置会话临时 Key" : "模型调用失败"}</strong>
+            <small>${escapeHtml(error)}</small>
+          </div>
+          <div class="chat-key-recovery-actions">
+            ${hasManualKey ? `<code>${escapeHtml(maskKey(state.chat.manualKey))}</code><button class="button ghost compact" data-action="chat-key-clear">${icon("trash-2")}<span>清除</span></button>` : ""}
+            <button class="button secondary compact" data-action="chat-manual-key">${icon("key-round")}<span>${hasManualKey ? "更换 Key" : "手动输入 Key"}</span></button>
+          </div>
+        </div>
+        ${inputHtml}
+      </div>`;
   }
 
   function renderChat() {
@@ -2705,7 +2728,7 @@
         `<button class="button ghost compact" data-action="chat-reset">${icon("rotate-ccw")}<span>新会话</span></button>`,
         "chat",
       )}
-      ${info && info.available === false ? `<div class="panel chat-offline">${icon("alert-triangle")}<span>${escapeHtml(info.error || "模型服务不可用")}</span></div>` : ""}
+      ${chatKeyRecoveryHtml()}
       <section class="chat-layout">
         <div class="chat-main">
           <div class="chat-toolbar">
@@ -2725,6 +2748,36 @@
       </section>`;
     renderChatMessages();
     refreshIcons($("#content"));
+  }
+
+  function openChatManualKey() {
+    state.chat.manualKeyOpen = true;
+    renderChat();
+    requestAnimationFrame(() => $("#chatManualKey")?.focus());
+  }
+
+  async function saveChatManualKey() {
+    const value = ($("#chatManualKey")?.value || "").trim();
+    if (value.length < 8) {
+      showToast("Key 至少需要 8 个字符", "error");
+      return;
+    }
+    state.chat.manualKey = value;
+    state.chat.manualKeyOpen = false;
+    state.chat.lastError = "";
+    renderChat();
+    await loadChatInfo(value);
+    if (state.chatInfo?.available) {
+      showToast("会话临时 Key 已启用", "success");
+    }
+  }
+
+  async function clearChatManualKey() {
+    state.chat.manualKey = "";
+    state.chat.manualKeyOpen = false;
+    state.chat.lastError = "";
+    renderChat();
+    await loadChatInfo();
   }
 
   let chatPaintFrame = null;
@@ -2787,6 +2840,7 @@
         },
         body: JSON.stringify({
           model: modelValue,
+          api_key: state.chat.manualKey || undefined,
           messages: state.chat.messages
             .slice(0, -1)
             .map((m) => ({ role: m.role, content: m.content })),
@@ -2839,6 +2893,7 @@
         }
       }
       if (doneEvent) {
+        state.chat.lastError = "";
         assistant.metrics = { ...(doneEvent.usage || {}), ...(doneEvent.metrics || {}) };
         state.chat.lastStats = assistant.metrics;
         const totals = state.chat.totals;
@@ -2849,6 +2904,7 @@
       }
     } catch (error) {
       showToast(error.message, "error");
+      state.chat.lastError = error.message;
       if (!assistant.content && !assistant.reasoning) {
         assistant.content = `(${error.message})`;
       }
@@ -2861,6 +2917,9 @@
   function resetChat() {
     confirmDialog("开始新会话", "将清空当前对话和统计。", "清空", () => {
       state.chat.messages = [];
+      state.chat.manualKey = "";
+      state.chat.manualKeyOpen = false;
+      state.chat.lastError = "";
       state.chat.lastStats = null;
       state.chat.totals = { turns: 0, prompt: 0, completion: 0, genMs: 0 };
       renderChat();
@@ -4101,10 +4160,6 @@
         } else if (action === "key-copy-curl") {
           const ok = await copyText(state.keyInfo?.curl || "");
           showToast(ok ? "curl 命令已复制" : "复制失败", ok ? "success" : "error");
-        } else if (action === "key-save") {
-          await saveModelKey();
-        } else if (action === "key-clear") {
-          clearModelKey();
         } else if (action === "chat-attach") {
           $("#chatFileInput")?.click();
         } else if (action === "chat-remove-attachment") {
@@ -4112,6 +4167,15 @@
           renderChatAttachments();
         } else if (action === "chat-reset") {
           resetChat();
+        } else if (action === "chat-manual-key") {
+          openChatManualKey();
+        } else if (action === "chat-key-save") {
+          await saveChatManualKey();
+        } else if (action === "chat-key-cancel") {
+          state.chat.manualKeyOpen = false;
+          renderChat();
+        } else if (action === "chat-key-clear") {
+          await clearChatManualKey();
         } else if (action === "alert-rules-save") {
           await saveAlertRules();
         } else if (action === "alert-rules-reset") {

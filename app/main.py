@@ -571,7 +571,8 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                 elif parsed.path == "/api/model/services":
                     self._json(self.app.model_control.list_services())
                 elif parsed.path == "/api/model/chat/info":
-                    self._json(self.app.model_chat.info())
+                    api_key = str(self.headers.get("X-Model-API-Key") or "").strip()
+                    self._json(self.app.model_chat.info(api_key=api_key or None))
                 elif parsed.path == "/api/model/key":
                     self._json(self.app.model_chat.key_info())
                 elif parsed.path == "/api/model/logs":
@@ -854,23 +855,6 @@ class SparkGridHandler(BaseHTTPRequestHandler):
             if not self._check_csrf(session):
                 return
             path = urllib.parse.urlparse(self.path).path
-            if path == "/api/model/key":
-                payload = self._read_json()
-                try:
-                    if payload.get("clear"):
-                        result = self.app.model_chat.clear_key()
-                        detail = "清除平台 Key 覆盖"
-                    else:
-                        result = self.app.model_chat.set_key(str(payload.get("key") or ""))
-                        detail = "设置平台 Key 覆盖"
-                except ChatError as exc:
-                    self._error(400, str(exc))
-                    return
-                self.app.db.add_audit(
-                    user, "model-key.update", "runtime", detail, self.client_address[0]
-                )
-                self._json(result)
-                return
             if path == "/api/alert-rules":
                 payload = self._read_json()
                 rules = payload.get("rules")
@@ -1058,6 +1042,7 @@ class SparkGridHandler(BaseHTTPRequestHandler):
 
     def _model_chat_stream(self) -> None:
         payload = self._read_json(max_bytes=16_000_000)
+        api_key = str(payload.pop("api_key", "") or "").strip() or None
         self.send_response(200)
         self._security_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1086,6 +1071,7 @@ class SparkGridHandler(BaseHTTPRequestHandler):
                 payload,
                 on_delta=lambda text: emit({"type": "delta", "content": text}),
                 on_reasoning=lambda text: emit({"type": "reasoning", "content": text}),
+                api_key=api_key,
             )
             emit(
                 {
@@ -1112,8 +1098,9 @@ class SparkGridHandler(BaseHTTPRequestHandler):
 
     def _model_chat(self) -> None:
         payload = self._read_json(max_bytes=16_000_000)
+        api_key = str(payload.pop("api_key", "") or "").strip() or None
         try:
-            result = self.app.model_chat.chat(payload)
+            result = self.app.model_chat.chat(payload, api_key=api_key)
         except ChatError as exc:
             self._error(502, str(exc))
             return

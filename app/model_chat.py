@@ -19,8 +19,8 @@ from typing import Any
 
 from .ssh_runner import SSHError
 
-KEY_OVERRIDE_SETTING = "model_api_key_override"
 KEY_TTL_SECONDS = 600.0
+ENDPOINT_TTL_SECONDS = 10.0
 CHAT_TIMEOUT_SECONDS = 300.0
 MAX_MESSAGES = 60
 MAX_CONTENT_CHARS = 32000
@@ -71,7 +71,14 @@ class ModelChat:
         self.config = config
         self.control = control
         self._lock = threading.Lock()
+        self._endpoint_lock = threading.Lock()
         self._key_cache: tuple[float, str] = (0.0, "")
+        self._endpoint_cache: tuple[float, str, tuple[int, ...], int] = (
+            0.0,
+            "",
+            (),
+            0,
+        )
 
     # ---------------------------------------------------------------- helpers
 
@@ -81,7 +88,50 @@ class ModelChat:
     def _endpoint(self) -> tuple[str, int]:
         head = self.control._head()
         ports = [int(port) for port in self._current().model_ports] or [8888]
-        return str(head["host"]), ports[0]
+        host = str(head["host"])
+        signature = tuple(ports)
+        now = time.time()
+        with self._endpoint_lock:
+            expires_at, cached_host, cached_ports, cached_port = self._endpoint_cache
+            if (
+                cached_port
+                and now < expires_at
+                and cached_host == host
+                and cached_ports == signature
+            ):
+                return cached_host, cached_port
+        for port in ports:
+            if self._endpoint_ready(host, port):
+                with self._endpoint_lock:
+                    self._endpoint_cache = (
+                        now + ENDPOINT_TTL_SECONDS,
+                        host,
+                        signature,
+                        port,
+                    )
+                return host, port
+        raise ChatError(
+            f"无法连接模型服务 {host}，已探测端口: {', '.join(map(str, ports))}"
+        )
+
+    def _model_scheme(self) -> str:
+        scheme = str(getattr(self._current(), "model_scheme", "http") or "http").lower()
+        return scheme if scheme in ("http", "https") else "http"
+
+    def _endpoint_ready(self, host: str, port: int) -> bool:
+        path = str(
+            getattr(self._current(), "model_health_path", "/health") or "/health"
+        )
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"{self._model_scheme()}://{host}:{port}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=1.5) as response:
+                return int(response.status) < 500
+        except urllib.error.HTTPError as exc:
+            return exc.code in (401, 403)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return False
 
     def _running_containers(self) -> list[str]:
         output = self.control._run(
@@ -89,22 +139,14 @@ class ModelChat:
         )
         return [line.strip() for line in output.splitlines() if line.strip()]
 
-    def _override_key(self) -> str:
-        try:
-            raw = (self.db.get_settings() or {}).get(KEY_OVERRIDE_SETTING)
-        except Exception:  # noqa: BLE001 - settings must not break chat
-            return ""
-        if not raw:
-            return ""
-        try:
-            return self.db.credential_cipher.decrypt(str(raw))
-        except Exception:  # noqa: BLE001
-            return ""
-
-    def _api_key(self) -> str:
-        override = self._override_key()
-        if override:
-            return override
+    def _api_key(self, api_key: str | None = None) -> str:
+        if api_key is not None:
+            value = str(api_key).strip()
+            if len(value) < 8:
+                raise ChatError("手动 Key 至少需要 8 个字符")
+            if len(value) > 256:
+                raise ChatError("手动 Key 过长（最多 256 字符）")
+            return value
         now = time.time()
         with self._lock:
             cached_at, cached_key = self._key_cache
@@ -160,11 +202,25 @@ class ModelChat:
             self._key_cache = (time.time(), value)
         return value
 
-    def _request(self, path: str, payload: dict[str, Any] | None = None, stream: bool = False):
+    def _request(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        stream: bool = False,
+        api_key: str | None = None,
+    ):
         host, port = self._endpoint()
-        key = self._api_key()
-        url = f"http://{host}:{port}{path}"
-        headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+        if api_key is not None:
+            key = self._api_key(api_key)
+        else:
+            try:
+                key = self._api_key()
+            except ChatError:
+                key = ""
+        url = f"{self._model_scheme()}://{host}:{port}{path}"
+        headers = {"Accept": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         data = None
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -190,22 +246,24 @@ class ModelChat:
     # ------------------------------------------------------------- public API
 
     def key_info(self) -> dict[str, Any]:
-        override = self._override_key()
         container_key = ""
+        container_error = ""
         try:
             container_key = self._read_container_key()
-        except ChatError:
+        except Exception as exc:  # noqa: BLE001 - detection must not break manual entry
             container_key = ""
-        effective = override or container_key
+            container_error = str(exc) or exc.__class__.__name__
+        effective = container_key
         host, port = "", 0
         models: list[str] = []
+        endpoint_error = ""
         try:
             host, port = self._endpoint()
             models = self.info().get("models", [])
-        except ChatError:
-            pass
+        except Exception as exc:  # noqa: BLE001 - detection must not break manual entry
+            endpoint_error = str(exc) or exc.__class__.__name__
         model = models[0] if models else ""
-        endpoint = f"http://{host}:{port}" if host else ""
+        endpoint = f"{self._model_scheme()}://{host}:{port}" if host else ""
         curl = ""
         if endpoint:
             body = (
@@ -221,39 +279,20 @@ class ModelChat:
         return {
             "key": effective,
             "has_key": bool(effective),
-            "source": "override" if override else ("container" if container_key else ""),
-            "override": bool(override),
+            "source": "container" if container_key else "",
             "container_key": container_key,
             "endpoint": endpoint,
             "model": model,
             "models": models,
             "curl": curl,
+            "error": container_error or endpoint_error,
         }
 
-    def set_key(self, key: str) -> dict[str, Any]:
-        value = str(key or "").strip()
-        if len(value) < 8:
-            raise ChatError("Key 至少需要 8 个字符")
-        if len(value) > 256:
-            raise ChatError("Key 过长（最多 256 字符）")
-        self.db.update_settings(
-            {KEY_OVERRIDE_SETTING: self.db.credential_cipher.encrypt(value)}
-        )
-        with self._lock:
-            self._key_cache = (0.0, "")
-        return self.key_info()
-
-    def clear_key(self) -> dict[str, Any]:
-        self.db.update_settings({KEY_OVERRIDE_SETTING: ""})
-        with self._lock:
-            self._key_cache = (0.0, "")
-        return self.key_info()
-
-    def info(self) -> dict[str, Any]:
+    def info(self, api_key: str | None = None) -> dict[str, Any]:
         host, port = "", 0
         try:
             host, port = self._endpoint()
-            response = self._request("/v1/models")
+            response = self._request("/v1/models", api_key=api_key)
             payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
             # vLLM lists both --served-model-name and the model path basename for
             # one deployment; collapse entries that share the same root.
@@ -272,7 +311,7 @@ class ModelChat:
                 models.append(model_id)
             return {
                 "available": True,
-                "endpoint": f"http://{host}:{port}",
+                "endpoint": f"{self._model_scheme()}://{host}:{port}",
                 "models": models,
                 "aliases": aliases,
                 "error": "",
@@ -280,7 +319,7 @@ class ModelChat:
         except ChatError as exc:
             return {
                 "available": False,
-                "endpoint": f"http://{host}:{port}" if host else "",
+                "endpoint": f"{self._model_scheme()}://{host}:{port}" if host else "",
                 "models": [],
                 "error": str(exc),
             }
@@ -290,6 +329,7 @@ class ModelChat:
         body: dict[str, Any],
         on_delta: Any = None,
         on_reasoning: Any = None,
+        api_key: str | None = None,
     ) -> dict[str, Any]:
         raw_messages = body.get("messages")
         if not isinstance(raw_messages, list) or not raw_messages:
@@ -346,7 +386,12 @@ class ModelChat:
         finish_reason = ""
         chunks = 0
 
-        response = self._request("/v1/chat/completions", payload, stream=True)
+        response = self._request(
+            "/v1/chat/completions",
+            payload,
+            stream=True,
+            api_key=api_key,
+        )
         try:
             for raw_line in response:
                 line = raw_line.decode("utf-8", "replace").strip()
