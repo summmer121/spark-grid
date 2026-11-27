@@ -20,7 +20,7 @@ from app.auth import hash_password, verify_password
 from app.config import Settings, load_settings
 from app.db import Database
 from app.discovery import DiscoveryService, LocalIPv4Interface
-from app.main import SparkGridApp, SparkGridServer, _parse_bulk_lines
+from app.main import SESSION_COOKIE, SparkGridApp, SparkGridServer, _parse_bulk_lines
 from app.model_chat import ChatError, ModelChat
 from app.model_monitor import (
     ModelMonitor,
@@ -945,6 +945,11 @@ class HttpIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 201)
         self.csrf = setup["csrf_token"]
+        session_cookies = [
+            cookie for cookie in self.cookies if cookie.name == SESSION_COOKIE
+        ]
+        self.assertTrue(session_cookies)
+        self.assertFalse(session_cookies[-1].secure)
 
         status, session = self.request("/api/session")
         self.assertEqual(status, 200)

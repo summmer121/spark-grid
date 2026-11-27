@@ -295,7 +295,8 @@ node --check app/static/js/app.js
 
 ## 安全建议
 
-- 通过 HTTPS 访问控制台，并设置 `SPARK_COOKIE_SECURE=1`
+- 直接通过 HTTP 访问内网或临时控制台时设置 `SPARK_COOKIE_SECURE=0`；这会让密码和会话以明文传输，仅适合受控网络。
+- 通过 HTTPS 或 TLS 反向代理访问生产控制台时设置 `SPARK_COOKIE_SECURE=1`；这是公网部署的推荐方式。
 - 不要提交 `.env`、`data/`、SQLite 数据库、`data/ssh-secret.key`、日志或 SSH 私钥
 - 使用独立管理员密码和专用 SSH 密钥
 - 限制控制台和 SSH 隧道监听范围

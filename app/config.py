@@ -60,7 +60,7 @@ def system_timezone_name() -> str:
 def current_ssh_user() -> str:
     try:
         return getpass.getuser().strip()
-    except (KeyError, OSError):
+    except (KeyError, ModuleNotFoundError, OSError):
         return ""
 
 
